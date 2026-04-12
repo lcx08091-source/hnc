@@ -1,7 +1,7 @@
 id=hotspot_network_control
 name=Hotspot Network Control
-version=v3.5.0-rc
-versionCode=3502
+version=v3.5.0
+versionCode=3503
 author=Claude (Anthropic AI)
-description=热点设备管控 v3.5.0 rc · R-1 hotspotd nl_process 1s de-bounce + R-2 60s 时间窗口 re-resolve(改名 bug 修复)+ R-3 device_detect.sh 警告更新 + R-4 smoke test 期望翻转 + R-5 README 重写 + R-6 ROADMAP + 6 个新 C 测试(总 97 个)。详见 CHANGELOG.md。
+description=热点设备管控 v3.5.0 正式版 · 工程化主题(测试 91→97 + GitHub Actions CI + hotspotd 生产可用)+ R-1 nl_process de-bounce + R-2 60s re-resolve + R-12 WebUI 离线检测 + R-13 hotspotd 周期清理 + 完整 README/ROADMAP。详见 CHANGELOG.md。
 minKernelSU=11485

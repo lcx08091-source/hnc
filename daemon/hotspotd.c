@@ -684,6 +684,18 @@ int main(int argc, char *argv[]) {
      * (Linux time(NULL) 秒精度,所以 1s 是最小可表达 de-bounce 窗口) */
     time_t dirty_since = 0;
 
+    /* v3.5.0-rc2 R-13: 周期性离线清理时间戳
+     * hotspotd 是事件驱动的,设备静默离开(关 wifi/出门)不会触发 RTM_DELNEIGH。
+     * 之前的离线判断只发生在 write_json 内,而 write_json 只在 dirty 时调用,
+     * 结果设备走了之后 devices.json 永远含旧设备(直到 hotspotd 重启)。
+     *
+     * 修复:主循环每 OFFLINE_CHECK_INTERVAL 秒强制扫一遍 g_devs[],把
+     * (now - last_seen) > OFFLINE_THRESHOLD 的设备 active=0,然后 set dirty
+     * 触发 write_json 重写文件 */
+    #define OFFLINE_CHECK_INTERVAL 30   /* 每 30s 检查一次 */
+    #define OFFLINE_THRESHOLD       90   /* 90s 未活跃 = 离线 */
+    time_t last_offline_check = time(NULL);
+
     /* ── 主事件循环 ────────────────────────────────────────── */
     while (g_running) {
         /* 处理 SIGUSR1 */
@@ -694,6 +706,26 @@ int main(int argc, char *argv[]) {
         }
 
         time_t now = time(NULL);
+
+        /* v3.5.0-rc2 R-13: 周期性离线清理 */
+        if (now - last_offline_check >= OFFLINE_CHECK_INTERVAL) {
+            int evicted = 0;
+            for (int i = 0; i < MAX_DEVICES; i++) {
+                Device *d = &g_devs[i];
+                if (!d->active) continue;
+                if (now - d->last_seen > OFFLINE_THRESHOLD) {
+                    hlog("OFFLINE: %s (%s) silent for %lds, evicting",
+                         d->mac, d->ip, (long)(now - d->last_seen));
+                    d->active = 0;
+                    evicted++;
+                }
+            }
+            if (evicted > 0) {
+                g_dirty = 1;
+                g_last_event = now;  /* 也算事件,触发 de-bounce 写入 */
+            }
+            last_offline_check = now;
+        }
 
         /* v3.5.0-rc R-1: de-bounce write
          * 1) g_dirty 刚从 0→1: 记 dirty_since

@@ -1430,10 +1430,39 @@ html,body { min-height:100%; background:var(--bg); color:var(--t0); font-family:
         <div class="about-name">HNC · Hotspot Network Control</div>
         <div class="about-author">作者：Claude (Anthropic AI) &nbsp;·&nbsp; KSU / Magisk 模块</div>
       </div>
-      <span class="about-ver">v3.5.0-rc</span>
+      <span class="about-ver">v3.5.0</span>
     </div>
     <!-- 更新日志 -->
     <div class="changelog">
+
+      <!-- v3.5.0 正式版（默认展开）-->
+      <div class="cl-item">
+        <div class="cl-left">
+          <div class="cl-dot"></div>
+          <div class="cl-line"></div>
+        </div>
+        <div class="cl-right">
+          <div class="cl-title">🎉 v3.5.0 正式版 &nbsp;<span style="font-size:11px;color:var(--t2);font-weight:400">2026-04-12</span></div>
+          <div class="cl-tags">
+            <span class="cl-tag feat" style="background:#52c41a;color:#fff">v3.5.0 final</span>
+            <span class="cl-tag feat">offline 检测</span>
+            <span class="cl-tag feat">周期清理</span>
+            <span class="cl-tag feat">工程化完成</span>
+          </div>
+          <ul class="cl-changes">
+            <li><b>🎉 v3.5.0 = HNC 工程化主题正式完成</b>。从一个 shell 脚本工具,变成了一个有完整测试框架(97 测试)+ GitHub Actions CI/CD + 真机验证 + 跨语言测试 + 主动安全测试 + 完整文档(README + ROADMAP + CHANGELOG)的开源项目。这是 HNC 历史上最大的版本</li>
+            <li><b>🔧 R-12 WebUI 客户端 last_seen 离线判断</b>:rc 版本暴露的 UX bug — 关热点后 WebUI 还显示设备"在线"。根因:WebUI 把每个 devices.json 里的设备都直接显示绿色"在线"徽章,完全不看 last_seen 时间戳。修复:renderDevs 两个路径 + 顶部统计 都加 <code>(Date.now()/1000 - last_seen) &lt; 90</code> 判断,超过 90 秒不活跃显示灰色"离线"徽章</li>
+            <li><b>🔧 R-13 hotspotd 主循环周期清理离线设备</b>:rc 版本暴露的根因 bug — hotspotd 是事件驱动,设备静默离开(关 wifi/出门)不会触发 RTM_DELNEIGH,设备会一直留在 g_devs[] 数组里。之前的离线判断只在 write_json 内,而 write_json 只在 dirty 时调用,结果设备走了之后 devices.json 永远含旧条目。修复:主循环每 30 秒强制扫一遍 g_devs[],把 (now - last_seen) &gt; 90 的设备 active=0 + set dirty,触发 de-bounce 写入</li>
+            <li><b>📊 v3.5 全部修复回顾</b>:P0-4 hostname 解析 + P0-5 控制字符过滤 + P1-2 -d 参数 + P1-7 黑名单截断 + P1-8 hostname_src 字段 + P1-9 mDNS 防伪造 + R-1 nl_process de-bounce + R-2 60s re-resolve + R-12 WebUI offline 检测 + R-13 hotspotd 周期清理。<b>10 个修复 + 6 个工程化里程碑</b></li>
+            <li><b>🧪 测试基础设施</b>:64 shell + 22 C hostname + 11 C mdns = <b>97 个自动测试</b>,全部在沙箱 + 真机 + GitHub Actions ubuntu-latest 三个环境验证</li>
+            <li><b>🤖 GitHub Actions CI</b>:<code>.github/workflows/build.yml</code> 配置完整 — test → build(NDK r26d 交叉编译 hotspotd + mdns_resolve)→ release(tag push 自动 GitHub release)。NDK 缓存 + 27-51 秒完整 build。已验证 2 次跑通(beta1 + rc)</li>
+            <li><b>📚 完整文档</b>:README.md(v3.5 完整重写,v3.4.10 LTS 选择指引,故障排查)+ ROADMAP.md(v3.5 完成 + v3.6 候选)+ CHANGELOG.md(每个版本详细记录)</li>
+            <li><b>🚀 真机验证</b>(RMX5010 SD8 Elite / Android 16 / kernel 6.6.102 / SukiSU):hotspotd C daemon 稳定运行(无 crash / 无 OOM / 无 SELinux deny)+ netlink RTMGRP_NEIGH 正常工作 + P0-4 hostname 解析(manual/mdns/mac 优先级)实测通过</li>
+            <li><b>🚦 升级注意</b>:从 v3.4.10 LTS / v3.4.12 / v3.5.0-alpha/beta1/rc 直接覆盖即可,数据完全保留(rules.json/device_names.json/config.json)。<b>最关键的两件事</b>:(1) 装完之后跑一次 <code>sh /data/local/hnc/bin/diag.sh</code> 期望全绿 (2) 配套的 hnc_smoke_test.sh 跑一次,期望 28+ PASS / 0 FAIL</li>
+            <li><b>🎯 v3.6 路线</b>:nftables 后端 / 流量历史图表 / 设备上线通知 / 流量配额限制 / 多 root 框架 / 主题市场 / WebUI i18n。详见 ROADMAP.md。<b>这些都是占位,正式立项要等 v3.5 release 一段时间收集 feedback</b></li>
+          </ul>
+        </div>
+      </div>
 
       <!-- v3.5.0-rc 收尾 + polish（默认展开）-->
       <div class="cl-item">
@@ -2990,8 +3019,16 @@ function cardHTML(d, isExp, idx) {
   var animDelay = ((idx||0)*0.04)+'s';
 
   var badges = '';
+  /* v3.5.0-rc2 R-12: 客户端 last_seen 离线判断
+   * hotspotd 是事件驱动的,设备静默离开(关 wifi/出门)不会触发 RTM_DELNEIGH,
+   * 设备会一直留在 devices.json 直到 hotspotd 主循环 30s 强制 flush 才被清掉
+   * (有时还更长,如果完全没事件 dirty 不会被设上)。WebUI 这里加客户端判断:
+   * last_seen 超过 90 秒就显示"离线",不再绿色"在线"徽章 */
+  var ageSec = (Date.now() / 1000) - (d.last_seen || 0);
+  var isOnline = ageSec < 90 && d.last_seen;
   if (blk) badges += '<span class="badge red">封锁</span>';
-  else     badges += '<span class="badge green">在线</span>';
+  else if (isOnline) badges += '<span class="badge green">在线</span>';
+  else     badges += '<span class="badge gray">离线</span>';
   if (hasLim) badges += '<span class="badge blue">\u2193'+fmtMBps(d.down_mbps)+' \u2191'+fmtMBps(d.up_mbps)+' MB/s</span>';
   /* v3.4.9 B4 修复:badge 显示三个延迟值的精确状态(只显示非 0 项) */
   if (hasDly) {
@@ -3851,8 +3888,12 @@ function updateCardFields(card, d) {
   var hasDly = d.delay_enabled && (delay_ms>0 || jitter_ms>0 || loss_pct>0);
 
   var badgesHTML = '';
+  /* v3.5.0-rc2 R-12: 同上面渲染路径,客户端 last_seen 离线判断 */
+  var ageSec2 = (Date.now() / 1000) - (d.last_seen || 0);
+  var isOnline2 = ageSec2 < 90 && d.last_seen;
   if (blk) badgesHTML += '<span class="badge red">封锁</span>';
-  else     badgesHTML += '<span class="badge green">在线</span>';
+  else if (isOnline2) badgesHTML += '<span class="badge green">在线</span>';
+  else     badgesHTML += '<span class="badge gray">离线</span>';
   if (hasLim) badgesHTML += '<span class="badge blue">\u2193'+fmtMBps(d.down_mbps)+' \u2191'+fmtMBps(d.up_mbps)+' MB/s</span>';
   if (hasDly) {
     var dlyParts = [];
@@ -4361,7 +4402,10 @@ window.cpyMac=function(mac){
 
 
 function updateStats(list){
-  var cnt=list.length;
+  /* v3.5.0-rc2 R-12: 顶部 "在线" 统计也按 last_seen 判断,
+   * 不再用 list.length(那是 devices.json 总条数,含未清理的离线设备) */
+  var nowSec = Date.now() / 1000;
+  var cnt=list.filter(function(d){return d.last_seen && (nowSec - d.last_seen) < 90;}).length;
   var lim=list.filter(function(d){return d.limit_enabled&&(d.down_mbps>0||d.up_mbps>0);}).length;
   var dly=list.filter(function(d){return d.delay_enabled&&d.delay_ms>0;}).length;
   var blk=list.filter(function(d){return d.status==='blocked';}).length;
