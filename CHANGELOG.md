@@ -2,6 +2,421 @@
 
 ---
 
+## 🚨 v3.5.1 紧急修复版 · 2026-04-12
+
+> **第三方 AI 代码安全审查发现 4 个 P0 + 3 个 P1**。v3.5.0 存在一个 catastrophic bug — 整个 P0-4 修复实际上从未生效(mDNS 一次都没真正发出过)。v3.5.1 修了所有 P0/P1,**v3.5.0 不应作为 release**,直接被 v3.5.1 替代。
+
+### 🎯 v3.5.1 修复总览
+
+| ID | 严重度 | 问题 | 影响 |
+|---|---|---|---|
+| **P0-1** | 🔴 严重 | hotspotd 调 mdns_resolve 多传一个 mac 参数 | mDNS 完全没工作过,所有 hostname 永远 mac 兜底 |
+| **P0-2** | 🔴 严重 | write_json hostname 不做 JSON escape | user 输入含 `"` 或 `\` → JSON 损坏 → WebUI 设备列表清空 |
+| **P0-3** | 🔴 严重 | saveHotspotConfig / testHotspotNow 直接拼 ssid/pass 到 kexec | 任何打开 WebUI 的人都可在 SSID 输入框注入 shell 命令(在 `u:r:su:s0` 上下文执行) |
+| **P0-4** | 🔴 严重 | acquire_lock force_break 不检查持锁进程存活 | 大文件 awk 慢时,两个进程同时写 tmp,JSON 损坏 |
+| **P1-2** | 🟡 重要 | hotspotd Device.rx_bytes/tx_bytes 永远 0 | hotspotd 模式下 WebUI 流量字节统计完全失效 |
+| **P1-7** | 🟡 重要 | watchdog 用 `echo $!` 写 hotspotd PID | hotspotd `-d` double-fork 后,$! 是 shell 子进程 PID,跟真 PID 竞争同一文件 |
+| **P2-6** | 🟢 polish | write_json 内 300s 离线判断是死代码(R-13 90s 先触发) | 代码混乱,无功能影响 |
+
+**总:7 个修复**,所有都来自第三方 AI 审查,没有一个是我自己发现的。
+
+---
+
+### 🔴 P0-1 — hotspotd 路径的 mDNS 解析从未工作过
+
+**这是 v3.5 最严重的 bug**。整整一个 alpha → beta1 → rc → final 周期我们声称 "P0-4 修复 hostname 解析对齐 shell",但 **C 路径的 mDNS 这一层从来没工作过**。
+
+**根因**:
+
+```c
+// hotspotd.c try_mdns_resolve (旧代码)
+snprintf(cmd, sizeof(cmd), "%s %s %s 2>/dev/null", MDNS_RESOLVE_BIN, ip, mac);
+```
+
+调用 `mdns_resolve <ip> <mac>`。但 `mdns_resolve.c main()` 解析参数时:
+
+```c
+while (i < argc) {
+    if (strcmp(argv[i], "-t") == 0) { ... }
+    else if (argv[i][0] == '-') { ... }
+    else {
+        ip = argv[i];   // ← 任何非 flag 参数都赋给 ip
+        i++;
+    }
+}
+```
+
+**两次循环**:
+1. `ip = "192.168.1.5"`
+2. `ip = "aa:bb:cc:dd:ee:ff"` ← **被覆盖**
+
+然后:
+
+```c
+if (inet_pton(AF_INET, ip, &tmp) != 1) {
+    return 1;  // ← inet_pton("aa:bb:cc:dd:ee:ff") 必然失败
+}
+```
+
+**结果**:`mdns_resolve` 每次都在第 416 行返回 1,**从来没真正发出过 mDNS 查询**。hotspotd 路径下,所有设备 hostname 永远走 mac 兜底,**P0-4 整个修复实际上没生效**。
+
+**为什么 alpha/beta1/rc/final 都没发现**:
+
+1. shell 路径调用 `mdns_resolve -t 800 "$ip"`(只 1 个参数),工作正常
+2. 真机 P0-4 验证我们看到的都是 `hostname_src: manual`(因为你设了名字),**从来没看到 `hostname_src: mdns`** — 我们当时**误以为**是设备没回 mDNS,实际是 hotspotd 调用方式错了
+3. test_hostname_helpers.c 没测 try_mdns_resolve(P1-3 — 复制函数测试模式的盲区)
+4. CI 测试是 mock,不跑真实 binary 调用
+
+**修复**:
+
+```c
+// 新代码:只传 ip,跟 shell 路径一致
+snprintf(cmd, sizeof(cmd), "%s -t 800 %s 2>/dev/null", MDNS_RESOLVE_BIN, ip);
+```
+
+**教训**:复制函数到测试文件是不够的,**还需要 integration test 跑实际 binary 调用**。这是 v3.6 测试基础设施需要解决的事。
+
+---
+
+### 🔴 P0-2 — write_json hostname 不做 JSON escape
+
+**根因**:
+
+```c
+// 旧代码
+fprintf(f, "\"hostname\":\"%s\",", d->hostname);
+```
+
+`d->hostname` 来自 `lookup_manual_name`(读 `device_names.json`,user 输入)或 `try_mdns_resolve`(网络数据)。如果 user 输入合法的 `My "Phone"`,`lookup_manual_name` 会把 `\"` 解码为 `"`,然后 `fprintf %s` 直接输出,JSON 变成:
+
+```json
+{"hostname":"My "Phone"",...}
+```
+
+**JSON 破损 → WebUI `JSON.parse` 失败 → 设备列表全清空**。
+
+**为什么 shell 路径没这个问题**:`do_scan_shell()` 用 `tr -d '\000-\037'` + `sed 's/\\/\\\\/g; s/"/\\"/g'` 转义。**C 路径完全漏掉**。
+
+**修复**:加 `json_escape` helper,处理 `" \ \n \r \t` 和 0x00-0x1f 控制字符:
+
+```c
+static void json_escape(const char *src, char *dst, size_t dst_size) {
+    if (dst_size == 0) return;
+    size_t j = 0;
+    for (size_t i = 0; src[i] && j + 1 < dst_size; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (c == '"' || c == '\\') {
+            if (j + 2 >= dst_size) break;
+            dst[j++] = '\\';
+            dst[j++] = (char)c;
+        } else if (c == '\n') { ... }
+        else if (c == '\r') { ... }
+        else if (c == '\t') { ... }
+        else if (c < 0x20) {
+            if (j + 6 >= dst_size) break;
+            j += snprintf(dst + j, dst_size - j, "\\u%04x", c);
+        } else {
+            dst[j++] = (char)c;  /* UTF-8 多字节字符 */
+        }
+    }
+    dst[j] = '\0';
+}
+```
+
+write_json 使用:
+
+```c
+char hn_escaped[HN_LEN * 6 + 4];  /* worst case: 每字节变 \u00xx */
+json_escape(d->hostname, hn_escaped, sizeof(hn_escaped));
+fprintf(f, "\"hostname\":\"%s\",", hn_escaped);
+```
+
+**新增 9 个 P0-2 单元测试**(test_hostname_helpers.c):
+- plain ASCII 不变
+- 双引号 / 反斜杠 / 换行 / 回车 / Tab escape
+- 控制字符变 `\u00xx`
+- 中文 UTF-8 不变
+- 空字符串
+- 小 buffer 安全截断
+
+**写测试时还发现 2 个 C 字符串字面量陷阱**:
+1. `"a\x01b"` 不是 `'a' + 0x01 + 'b'`,而是 `'a' + 0x1b`(因为 `\x` 后接任意多 hex)。改用八进制 `"a\001b"`
+2. 原 json_escape 循环条件 `j + 2 < dst_size` 太严,纯 ASCII 输入填不满 buffer。改成 `j + 1 < dst_size` + 每个 escape 分支自己检查
+
+第 2 个不只是测试 bug,**也是真代码 bug**:之前 hostname 长度刚好 = HN_LEN-2 时会被错误截断。**已修**。
+
+---
+
+### 🔴 P0-3 — Shell 命令注入(saveHotspotConfig + testHotspotNow)
+
+**根因**:
+
+```js
+// webroot/index.html 旧代码
+var ssid = document.getElementById('hs-ssid').value || '';
+var pass = document.getElementById('hs-pass').value || '';
+kexec('sh '+JS+' top hotspot_ssid "'+ssid+'"')
+kexec('sh '+HNC+'/bin/hotspot_autostart.sh start "'+ssid+'" "'+pass+'"')
+```
+
+**ssid 和 pass 是 user 输入,完全没转义**。在 SSID 输入框输入:
+
+```
+foo"; rm -rf /data/local/hnc/data; echo "
+```
+
+执行后变成:
+
+```sh
+sh /data/local/hnc/bin/json_set.sh top hotspot_ssid "foo"; rm -rf /data/local/hnc/data; echo ""
+```
+
+**HNC 数据全删**。在 `u:r:su:s0` SELinux context 下执行,可以做更危险的操作。
+
+**攻击模型**:已能打开 WebUI 的人(本机 user)。虽然他/她有 root,毁数据没意思 — **但是这个洞表明代码 review 没覆盖 user input → kexec 的所有路径**。一个负责任的项目不能容忍这种洞。
+
+**editName 之前的"对比"**:editName 处理了 `\\ " $ \``,看起来安全(实测 `\"` 在双引号内是字面字符,不会触发命令注入)。但是 ad-hoc 的 escape 列表容易漏。
+
+**修复**:加 `shellQuote` 函数(POSIX 标准 single-quote escape):
+
+```js
+function shellQuote(s) {
+  return "'" + String(s).replace(/'/g, "'\\''") + "'";
+}
+```
+
+把每个 `'` 替换成 `'\''`(关闭单引号 + 转义单引号 + 重开单引号),然后整体用单引号包起来。这是 POSIX shell quoting 的标准做法,**对所有特殊字符都安全**(`'` `"` `;` `&` `|` `$` `` ` `` `\n` 等)。
+
+**3 处替换**:
+
+```js
+// saveHotspotConfig
+kexec('sh '+JS+' top hotspot_ssid '+shellQuote(ssid))
+kexec('sh '+JS+' top hotspot_pass '+shellQuote(pass))
+kexec('sh '+JS+' top hotspot_delay '+shellQuote(delay))
+
+// testHotspotNow
+kexec('sh '+HNC+'/bin/hotspot_autostart.sh start '+shellQuote(ssid)+' '+shellQuote(pass)+' 2>/dev/null')
+
+// editName(systemic 加固,虽然之前 ad-hoc 转义也安全)
+kexec('sh '+HNC+'/bin/json_set.sh name_set '+shellQuote(mac)+' '+shellQuote(name))
+kexec('sh '+HNC+'/bin/json_set.sh name_del '+shellQuote(mac))
+kexec('grep -v '+shellQuote('^'+mac+'|')+' '+HNC+'/run/hostname_cache > ...')
+```
+
+**审计了所有 kexec 调用点**(40+ 个),其余都是数字(mid/dn/up/dl/jt/ls)或来自设备列表(ip/mac,hotspotd 写的可信值),不需要额外 escape。
+
+---
+
+### 🔴 P0-4 — acquire_lock force_break 不检查 PID 存活
+
+**根因**:
+
+```sh
+# 旧代码
+acquire_lock() {
+    while [ $i -lt 50 ]; do
+        if mkdir "$LOCKDIR" 2>/dev/null; then return 0; fi
+        if [ $i -eq 20 ]; then
+            rmdir "$LOCKDIR" 2>/dev/null   # ← 无条件强拆
+        fi
+        ...
+    done
+}
+```
+
+第 20 次重试(2 秒)无条件强拆锁,**不检查持锁进程是不是还活着**。如果 awk 处理大文件慢,持锁进程 A 还在工作,进程 B 强拆锁进入,A 和 B 同时 mv 到 tmp,JSON 损坏。
+
+**讽刺**:json_set.sh 的 P0-2 锁修复(v3.4.10 时候)**自己的 force_break 实现击穿了它**。
+
+**修复**:PID-based lock,锁目录里写持锁 PID,force_break 之前 `kill -0` 检查存活:
+
+```sh
+acquire_lock() {
+    local i=0
+    while [ $i -lt 50 ]; do
+        if mkdir "$LOCKDIR" 2>/dev/null; then
+            echo $$ > "$LOCKDIR/pid"   # 写自己 PID
+            trap 'rm -f "$LOCKDIR/pid"; rmdir "$LOCKDIR"' EXIT INT TERM
+            return 0
+        fi
+        if [ $i -eq 20 ]; then
+            local lock_pid=$(cat "$LOCKDIR/pid" 2>/dev/null)
+            if [ -z "$lock_pid" ]; then
+                # 锁目录存在但没 PID 文件 — 给一次机会再等
+                _short_sleep
+                i=$((i+1))
+                continue
+            fi
+            if kill -0 "$lock_pid" 2>/dev/null; then
+                echo "json_set: lock held by alive PID $lock_pid, waiting" >&2
+            else
+                echo "json_set: force-break stale lock (dead PID $lock_pid)" >&2
+                rm -f "$LOCKDIR/pid"
+                rmdir "$LOCKDIR"
+            fi
+        fi
+        _short_sleep
+        i=$((i+1))
+    done
+    return 1
+}
+```
+
+---
+
+### 🟡 P1-2 — hotspotd 模式下流量字节永远 0
+
+**根因**:
+
+```c
+typedef struct {
+    ...
+    long rx_bytes;   // ← 永远 0
+    long tx_bytes;   // ← 永远 0
+} Device;
+
+// write_json
+fprintf(f, "\"rx_bytes\":%ld,\"tx_bytes\":%ld,",
+    d->rx_bytes, d->tx_bytes);
+```
+
+Device.rx_bytes / tx_bytes 在 alloc_device 后永远是 0,**没有任何代码赋值过它们**。shell 路径有 `iptables_manager.sh stats_all` 读 iptables HNC_STATS 链的真字节数,**hotspotd 路径完全没读**。
+
+**结果**:hotspotd 模式下 WebUI 的"上下行字节"显示永远是 0,**这是真功能退化**。
+
+**为什么没发现**:smoke test 只看 hostname_src 字段,从来没看 rx/tx。真机 WebUI 你可能看了但忘了说(你早上的 smoke test 输出 `"rx_bytes":0,"tx_bytes":0` 我没注意到这是 bug)。
+
+**修复**:加 `update_traffic_stats` helper,write_json 开头调用:
+
+```c
+static void update_traffic_stats(void) {
+    if (access(IPTABLES_MGR, X_OK) != 0) return;
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "sh %s stats_all 2>/dev/null", IPTABLES_MGR);
+    FILE *pf = popen(cmd, "r");
+    if (!pf) return;
+
+    char line[128];
+    while (fgets(line, sizeof(line), pf) != NULL) {
+        char ip[IP_STR_LEN];
+        long rx, tx;
+        if (sscanf(line, "%15s %ld %ld", ip, &rx, &tx) == 3) {
+            for (int i = 0; i < MAX_DEVICES; i++) {
+                if (g_devs[i].active && strcmp(g_devs[i].ip, ip) == 0) {
+                    g_devs[i].rx_bytes = rx;
+                    g_devs[i].tx_bytes = tx;
+                    break;
+                }
+            }
+        }
+    }
+    pclose(pf);
+}
+```
+
+`stats_all` 输出格式 `<ip> <rx> <tx>`,by IP 索引到 g_devs[]。
+
+**性能**:popen + awk + iptables 一次约 50-100ms。配合 R-1 de-bounce(1s 窗口),实际不会比 shell 路径慢。**比之前永远 0 强**。
+
+---
+
+### 🟡 P1-7 — watchdog 写错 hotspotd PID
+
+**根因**:
+
+```sh
+# bin/watchdog.sh 旧代码
+"$HNC_DIR/bin/hotspotd" -d >> "$HNC_DIR/logs/hotspotd.log" 2>&1 &
+echo $! > "$RUN/hotspotd.pid"
+```
+
+`hotspotd -d` 会 **double-fork 后台化**,自己 `write_pid()` 写**真** PID。但 `$!` 是 **shell 后台子进程 PID**(可能立即 exit,因为 hotspotd fork 了)。两个写法竞争同一文件:
+
+- 如果 `echo $! > pid` 后写,文件存的是错的 PID(已死的 shell 子进程 PID)
+- 下次 watchdog `kill -0 $hpid` 用错 PID,**永远失败**
+- 触发重启 — 但有 60s cooldown 防止暴力重启
+
+**修复**:删 `echo $!` 行,让 hotspotd 自己写真 PID:
+
+```sh
+"$HNC_DIR/bin/hotspotd" -d >> "$HNC_DIR/logs/hotspotd.log" 2>&1 &
+sleep 1   # 等 hotspotd 自己写 PID 文件
+HOTSPOTD_LAST_RESTART=$now
+```
+
+`device_detect.sh daemon_mode()` 启动 hotspotd 的地方早就是这种写法(只让 hotspotd 自己写 PID),只有 watchdog 路径有这个 race。
+
+---
+
+### 🟢 P2-6 — write_json 内 300s 死代码
+
+**根因**:R-13 加了主循环 30s 周期 + 90s 阈值的离线清理,但 write_json 里之前的 300s 判断**没删**。两个并存,300s 永远触发不到(R-13 90s 先清),逻辑混乱。
+
+**修复**:删 write_json 内的 300s 判断,统一由 R-13 主循环负责离线清理。
+
+---
+
+### 🧪 测试增强:从 97 → **106**
+
+| 测试 | 之前 | v3.5.1 |
+|---|---|---|
+| Shell 框架自检 | 15 | 15 |
+| Shell json_set.sh | 30 | 30 |
+| Shell iptables_tc | 19 | 19 |
+| C hostname_helpers | 22 | **31** (+9 P0-2) |
+| C mdns parse | 11 | 11 |
+| **总** | **97** | **106** |
+
+新增 9 个 P0-2 测试覆盖:plain / `"` / `\` / `\n` / `\r` / `\t` / 控制字符 / 中文 UTF-8 / 空字符串 / 小 buffer 截断。
+
+**测试方式发现的 2 个真 bug**(C 字面量陷阱 + 循环条件太严),**两个都已经 backport 到 hotspotd.c**。
+
+---
+
+### 📦 修改文件汇总
+
+| 文件 | 改动 |
+|---|---|
+| `module.prop` | v3.5.0 → **v3.5.1** / 3503 → **3504** |
+| `bin/diag.sh` | 版本号 |
+| `webroot/index.html` | about-ver + shellQuote 函数 + saveHotspotConfig + testHotspotNow + editName 加固(3 处)+ v3.5.1 changelog item |
+| `daemon/hotspotd.c` | P0-1 删 mac 参数 + P0-2 json_escape + P1-2 update_traffic_stats + P2-6 删 300s 死代码 |
+| `daemon/test/test_hostname_helpers.c` | +9 个 P0-2 测试 + json_escape 复制(同步主代码) |
+| `bin/json_set.sh` | P0-4 PID-based lock |
+| `bin/watchdog.sh` | P1-7 删 echo $! |
+| `CHANGELOG.md` | 本段落 |
+| `hnc_smoke_test.sh` | 期望版本 v3.5.0 → v3.5.1 |
+
+---
+
+### 🚦 升级注意
+
+- **v3.5.0 不能作为 GitHub Release**。任何已经装了 v3.5.0 的人**应该立刻升级 v3.5.1**
+- **从 v3.5.0 直接覆盖** rules.json / device_names.json / config.json 都保留
+- **如果你之前在 v3.5.0 上改过设备名含 `"` 或 `\`**,可能 devices.json 已经损坏,升级后自动重写
+- **如果你之前在 v3.5.0 上改过 SSID/密码** — 检查 rules.json 看是否有奇怪内容
+
+### 🎯 工程教训(最重要的部分)
+
+**v3.5.0 自称是"工程化主题完成版本",但 4 个 P0 全部漏过了 alpha → beta1 → rc → final 4 个阶段的测试**。这说明:
+
+1. **97 个测试不等于代码安全** — 测试覆盖的是函数级别的 unit test,**端到端 integration test 完全缺失**
+2. **复制函数到测试文件的模式有盲区** — `test_hostname_helpers.c` 复制了 `lookup_manual_name`,但**没复制 `try_mdns_resolve`**,所以 P0-1 永远不可能被这个模式测出来
+3. **每次新增 kexec 调用点都需要专门 audit** — saveHotspotConfig 和 testHotspotNow 是 v3.4.x 时代的代码,从来没被 audit 过 escape
+4. **没有第三方 review 就有 blind spots** — 我自己 audit 看不到自己的 bug,需要别的 AI / 人来审
+
+**v3.5.1 是 v3.5 真正的成熟版本**。v3.5.0 的发布只是把"工程基础设施"建好了,v3.5.1 才是把"功能正确性"建好了。
+
+**v3.6 必须做的事**:
+
+- ✅ 加 integration test framework(真实跑 binary,不只是 mock)
+- ✅ 提取 `daemon/hotspotd.c` 的 helper 函数到 `daemon/hostname_helpers.c`,测试文件 `#include` 而不是复制
+- ✅ 加 negative test(故意输入 injection payload 验证防御生效)
+- ✅ kexec 调用审计 checklist(任何新 kexec 必须用 shellQuote)
+
+---
+
 ## 🎉 v3.5.0 正式版 · 2026-04-12
 
 > **HNC 工程化主题正式完成**。从一个 shell 脚本工具,变成了一个有完整测试框架(97 测试)+ GitHub Actions CI/CD + 真机验证 + 跨语言测试 + 主动安全测试 + 完整文档(README + ROADMAP + CHANGELOG)的开源项目。这是 HNC 历史上最大的版本。

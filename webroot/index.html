@@ -1430,10 +1430,43 @@ html,body { min-height:100%; background:var(--bg); color:var(--t0); font-family:
         <div class="about-name">HNC · Hotspot Network Control</div>
         <div class="about-author">作者：Claude (Anthropic AI) &nbsp;·&nbsp; KSU / Magisk 模块</div>
       </div>
-      <span class="about-ver">v3.5.0</span>
+      <span class="about-ver">v3.5.1</span>
     </div>
     <!-- 更新日志 -->
     <div class="changelog">
+
+      <!-- v3.5.1 紧急修复版（默认展开）-->
+      <div class="cl-item">
+        <div class="cl-left">
+          <div class="cl-dot"></div>
+          <div class="cl-line"></div>
+        </div>
+        <div class="cl-right">
+          <div class="cl-title">🚨 v3.5.1 紧急修复版 &nbsp;<span style="font-size:11px;color:var(--t2);font-weight:400">2026-04-12</span></div>
+          <div class="cl-tags">
+            <span class="cl-tag feat" style="background:#dc2626;color:#fff">v3.5.1 hotfix</span>
+            <span class="cl-tag feat">第三方 AI 审查</span>
+            <span class="cl-tag feat">4 P0 + 3 P1</span>
+            <span class="cl-tag feat">106 测试</span>
+          </div>
+          <ul class="cl-changes">
+            <li><b>🚨 v3.5.1 = 第三方 AI 安全审查发现 4 个 P0 + 3 个 P1</b>。v3.5.0 自称工程化主题完成,但 4 个 P0 漏过了 alpha → beta1 → rc → final 4 个阶段。<b>v3.5.0 不应作为 release</b>,直接被 v3.5.1 替代</li>
+            <li><b>🔴 P0-1 hotspotd mDNS 完全没工作过(catastrophic)</b>:hotspotd 调 <code>mdns_resolve &lt;ip&gt; &lt;mac&gt;</code> 两个参数,但 mdns_resolve 解析循环把任何非 flag 参数都赋给 ip,第二次循环 ip 被 mac 覆盖,<code>inet_pton</code> 必然失败 → 从来没真正发出过 mDNS 查询。<b>整个 alpha → final 周期 P0-4 hostname 解析里"mDNS"这一层从来没生效过</b>。修复:删 mac 参数,只传 <code>-t 800 &lt;ip&gt;</code></li>
+            <li><b>🔴 P0-2 write_json hostname 不做 JSON escape</b>:user 输入合法的 <code>My "Phone"</code> → lookup_manual_name 解码 → write_json <code>%s</code> 直接输出 → JSON 损坏 → WebUI 设备列表清空。修复:加 <code>json_escape</code> helper 处理 <code>" \ \n \r \t</code> 和 0x00-0x1f 控制字符。<b>shell 路径有 tr+sed 转义,C 路径完全漏掉</b></li>
+            <li><b>🔴 P0-3 saveHotspotConfig + testHotspotNow shell 命令注入</b>:ssid/pass 从 input 框直接拼到 kexec 命令字符串,在 SSID 框输入 <code>foo"; rm -rf /data/local/hnc/data; echo "</code> 即可在 <code>u:r:su:s0</code> SELinux 上下文执行任意命令。修复:加 <code>shellQuote</code> 函数(POSIX single-quote escape),3 处替换。同时 editName 也加固(虽然之前 ad-hoc 转义实测安全,但 systematic 比 ad-hoc 更可靠)</li>
+            <li><b>🔴 P0-4 acquire_lock force_break 不检查 PID 存活</b>:第 20 次重试(2 秒)无条件 <code>rmdir</code>,持锁进程 A 还在跑大文件 awk 时,B 强拆锁进入,两个 mv 同时写 tmp,JSON 损坏。讽刺的是 <b>v3.4.10 时的 P0-2 锁修复被自己的 force_break 实现击穿</b>。修复:PID-based lock,锁目录里写持锁 PID,force_break 之前 <code>kill -0</code> 检查存活</li>
+            <li><b>🟡 P1-2 hotspotd 模式下流量字节永远 0</b>:Device.rx_bytes/tx_bytes 在 alloc_device 后永远是 0,没有任何代码赋值过它们。shell 路径调 <code>iptables_manager.sh stats_all</code> 读真实字节数,hotspotd 路径完全没读 → <b>WebUI 上下行字节统计永远 0</b>(真功能退化)。修复:加 <code>update_traffic_stats</code> helper,write_json 开头调 <code>popen sh stats_all</code>,by IP 索引到 g_devs[]</li>
+            <li><b>🟡 P1-7 watchdog 写错 hotspotd PID</b>:<code>echo $! &gt; pid</code>,但 <code>$!</code> 是 shell 后台子进程 PID,hotspotd <code>-d</code> double-fork 后,真 PID 是另一个。两个写法竞争同一文件,可能存的是错的 PID,导致下次 <code>kill -0</code> 永远失败,触发重启风暴(60s cooldown 兜底)。修复:删 <code>echo $!</code>,让 hotspotd 自己 <code>write_pid()</code></li>
+            <li><b>🟢 P2-6 write_json 内 300s 死代码</b>:R-13 加了主循环 30s 周期 + 90s 阈值的离线清理,但 write_json 里之前的 300s 判断没删。两个并存,300s 永远触发不到。修复:删 write_json 内的 300s 判断,统一由 R-13 主循环负责</li>
+            <li><b>🧪 测试增强 97 → 106</b>:新增 9 个 P0-2 测试(plain / " / \\ / \\n / \\r / \\t / 控制字符 / 中文 UTF-8 / 空字符串 / 小 buffer 截断)。写测试时还发现 2 个 C 字面量陷阱:<code>"a\\x01b"</code> 不是 <code>'a' + 0x01 + 'b'</code> 而是 <code>'a' + 0x1b</code>(\\x 后接任意多 hex);json_escape 循环条件 <code>j + 2 &lt; dst_size</code> 太严,纯 ASCII 输入填不满 buffer。<b>第 2 个不只是测试 bug 也是真代码 bug</b>(hostname 长度 = HN_LEN-2 时被错误截断),已 backport 到 hotspotd.c</li>
+            <li><b>📚 工程教训(最重要)</b>:v3.5.0 自称工程化主题完成,但 4 个 P0 全部漏过 4 个阶段的测试。这说明 (1) 97 个测试不等于代码安全 — 覆盖的是函数级 unit test,端到端 integration test 完全缺失 (2) 复制函数到测试文件的模式有盲区 — test_hostname_helpers.c 复制了 lookup_manual_name 但没复制 try_mdns_resolve,所以 P0-1 永远不可能被这个模式测出来 (3) 每次新增 kexec 调用点都需要专门 audit (4) <b>没有第三方 review 就有 blind spots</b>,我自己 audit 看不到自己的 bug</li>
+            <li><b>📦 修改文件</b>:module.prop(v3.5.1 / 3504)+ webroot/index.html(about-ver + shellQuote 函数 + 3 处 kexec 替换 + 本段)+ bin/diag.sh(版本)+ daemon/hotspotd.c(P0-1 + P0-2 + P1-2 + P2-6)+ daemon/test/test_hostname_helpers.c(+9 测试)+ bin/json_set.sh(P0-4 PID lock)+ bin/watchdog.sh(P1-7)+ CHANGELOG.md + hnc_smoke_test.sh</li>
+            <li><b>🚦 升级注意</b>:从 v3.5.0 / v3.4.x 直接覆盖,数据完全保留。如果你之前在 v3.5.0 上改过设备名含 <code>"</code> 或 <code>\</code>,可能 devices.json 已经损坏,升级后自动重写。如果在 v3.5.0 上改过 SSID/密码,检查 rules.json 看是否有奇怪内容</li>
+            <li><b>🎯 v3.6 必须做的事</b>:加 integration test framework(真实跑 binary 不只是 mock)+ 提取 hotspotd.c helper 到 hostname_helpers.c 让测试 #include 而不是复制 + 加 negative test(故意输入 injection payload 验证防御)+ kexec 调用审计 checklist</li>
+            <li><b>💭 v3.5.1 的真实价值</b>:v3.5.0 是把"工程基础设施"建好了的版本,v3.5.1 才是把"功能正确性"建好了的版本。<b>v3.5.1 才是 v3.5 真正的成熟版本</b></li>
+          </ul>
+        </div>
+      </div>
 
       <!-- v3.5.0 正式版（默认展开）-->
       <div class="cl-item">
@@ -2926,6 +2959,18 @@ function escAttrJs(s) {
     .replace(/</g,  '\\u003C')
     .replace(/>/g,  '\\u003E');
 }
+/* v3.5.1 P0-3: shell 单引号转义,用于 kexec 拼命令字符串
+ * 用法: kexec('sh script.sh '+shellQuote(userInput))
+ * 输出永远是 'foo' 'bar' 形式,即使 user 输入含 ' " ; & | $ ` \n 都安全。
+ *
+ * 算法:把每个 ' 替换成 '\''(关闭单引号 + 转义单引号 + 重开单引号),
+ * 然后整体用单引号包起来。这是 POSIX shell quoting 的标准做法。
+ *
+ * 之前 saveHotspotConfig / testHotspotNow 直接拼 ssid/pass 到 kexec 命令,
+ * 导致 user 输入 'foo"; rm -rf /; echo "' 即可 RCE 删数据。 */
+function shellQuote(s) {
+  return "'" + String(s).replace(/'/g, "'\\''") + "'";
+}
 /* v3.4.4：fmtB 升级支持 GB,用于显示累计字节 */
 function fmtB(b){
   b=Number(b)||0;
@@ -4139,15 +4184,17 @@ window.editName = function(mac, currentName) {
       var promise;
       if (!name) {
         /* 空字符串 → 删除条目 */
-        promise = kexec('sh '+HNC+'/bin/json_set.sh name_del "'+mac+'"');
+        promise = kexec('sh '+HNC+'/bin/json_set.sh name_del '+shellQuote(mac));
       } else {
-        /* 转义 shell 特殊字符:'\' '"' '$' '`' */
-        var safe = name.replace(/\\/g,'\\\\').replace(/"/g,'\\"').replace(/\$/g,'\\$').replace(/`/g,'\\`');
-        promise = kexec('sh '+HNC+'/bin/json_set.sh name_set "'+mac+'" "'+safe+'"');
+        /* v3.5.1 P0-3: 改用 shellQuote 而不是 ad-hoc 转义,
+         * 之前的 .replace(/\\/g,...).replace(/"/g,...) 处理了 \" $ ` 但漏了 ; & |
+         * (实际不会触发,因为 \" 在 sh 双引号内是字面字符,但 systematic 比 ad-hoc 安全) */
+        promise = kexec('sh '+HNC+'/bin/json_set.sh name_set '+shellQuote(mac)+' '+shellQuote(name));
       }
       promise.then(function(){
-        /* 同时清掉 hostname_cache,让下次扫描重新走优先级链 */
-        return kexec('grep -v "^'+mac+'|" '+HNC+'/run/hostname_cache > '+HNC+'/run/hostname_cache.tmp 2>/dev/null; mv '+HNC+'/run/hostname_cache.tmp '+HNC+'/run/hostname_cache 2>/dev/null; true');
+        /* 同时清掉 hostname_cache,让下次扫描重新走优先级链
+         * v3.5.1 P0-3: mac 用 shellQuote */
+        return kexec('grep -v '+shellQuote('^'+mac+'|')+' '+HNC+'/run/hostname_cache > '+HNC+'/run/hostname_cache.tmp 2>/dev/null; mv '+HNC+'/run/hostname_cache.tmp '+HNC+'/run/hostname_cache 2>/dev/null; true');
       }).then(function(){
         toast(name ? ('已命名为 '+name) : '已清除自定义名', 'ok');
         /* 触发一次扫描刷新名字 */
@@ -4555,10 +4602,12 @@ window.saveHotspotConfig = function() {
   var pass    = (document.getElementById('hs-pass')||{}).value||'';
   var delay   = (document.getElementById('hs-delay')||{}).value||'60';
   toast('保存中…','in');
-  /* v3.4.9: 串行写入 SSID/密码/延迟,删除充电限制+时间段限制 */
-  kexec('sh '+JS+' top hotspot_ssid "'+ssid+'"')
-  .then(function(){ return kexec('sh '+JS+' top hotspot_pass "'+pass+'"'); })
-  .then(function(){ return kexec('sh '+JS+' top hotspot_delay '+delay); })
+  /* v3.4.9: 串行写入 SSID/密码/延迟,删除充电限制+时间段限制
+   * v3.5.1 P0-3: ssid/pass 用 shellQuote 防 shell 命令注入
+   * (delay 是数字输入,但保险起见也 quote 一下) */
+  kexec('sh '+JS+' top hotspot_ssid '+shellQuote(ssid))
+  .then(function(){ return kexec('sh '+JS+' top hotspot_pass '+shellQuote(pass)); })
+  .then(function(){ return kexec('sh '+JS+' top hotspot_delay '+shellQuote(delay)); })
   .then(function(){ toast('热点配置已保存','ok'); })
   .catch(function(e){ toast('保存失败: '+e.message,'er'); });
 };
@@ -4567,7 +4616,8 @@ window.testHotspotNow = function() {
   var ssid = (document.getElementById('hs-ssid')||{}).value || '';
   var pass = (document.getElementById('hs-pass')||{}).value || '';
   toast('正在启动热点…', 'in');
-  kexec('sh '+HNC+'/bin/hotspot_autostart.sh start "'+ssid+'" "'+pass+'" 2>/dev/null')
+  /* v3.5.1 P0-3: 同上,shellQuote 防注入 */
+  kexec('sh '+HNC+'/bin/hotspot_autostart.sh start '+shellQuote(ssid)+' '+shellQuote(pass)+' 2>/dev/null')
   .then(function() {
     toast('热点启动成功', 'ok');
     initHotspotUI();

@@ -269,6 +269,102 @@ static void test_re_resolve_mdns_at_exactly_60(void) {
     ASSERT_INT_EQ(1, rc, "mdns at exactly 60s: re-resolve (>= boundary)");
 }
 
+/* === v3.5.1 P0-2: json_escape 测试 ===
+ *
+ * 复刻 hotspotd.c 的 json_escape 函数。
+ * 之前 write_json 用 %s 直接输出 hostname,如果 hostname 含 " 或 \
+ * 会破坏 JSON,WebUI 设备列表清空。
+ */
+
+static void json_escape(const char *src, char *dst, size_t dst_size) {
+    if (dst_size == 0) return;
+    size_t j = 0;
+    /* 循环条件 j + 1 < dst_size: 留 1 字节给末尾 NUL */
+    for (size_t i = 0; src[i] && j + 1 < dst_size; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (c == '"' || c == '\\') {
+            if (j + 2 >= dst_size) break;
+            dst[j++] = '\\';
+            dst[j++] = (char)c;
+        } else if (c == '\n') {
+            if (j + 2 >= dst_size) break;
+            dst[j++] = '\\'; dst[j++] = 'n';
+        } else if (c == '\r') {
+            if (j + 2 >= dst_size) break;
+            dst[j++] = '\\'; dst[j++] = 'r';
+        } else if (c == '\t') {
+            if (j + 2 >= dst_size) break;
+            dst[j++] = '\\'; dst[j++] = 't';
+        } else if (c < 0x20) {
+            if (j + 6 >= dst_size) break;
+            j += snprintf(dst + j, dst_size - j, "\\u%04x", c);
+        } else {
+            dst[j++] = (char)c;
+        }
+    }
+    dst[j] = '\0';
+}
+
+static void test_json_escape_plain(void) {
+    char out[64];
+    json_escape("hello", out, sizeof(out));
+    ASSERT_EQ("hello", out, "plain ascii unchanged");
+}
+
+static void test_json_escape_double_quote(void) {
+    char out[64];
+    json_escape("My \"Phone\"", out, sizeof(out));
+    ASSERT_EQ("My \\\"Phone\\\"", out, "double quote escaped");
+}
+
+static void test_json_escape_backslash(void) {
+    char out[64];
+    json_escape("a\\b", out, sizeof(out));
+    ASSERT_EQ("a\\\\b", out, "backslash escaped");
+}
+
+static void test_json_escape_newline(void) {
+    char out[64];
+    json_escape("line1\nline2", out, sizeof(out));
+    ASSERT_EQ("line1\\nline2", out, "newline escaped");
+}
+
+static void test_json_escape_tab_cr(void) {
+    char out[64];
+    json_escape("a\tb\rc", out, sizeof(out));
+    ASSERT_EQ("a\\tb\\rc", out, "tab and CR escaped");
+}
+
+static void test_json_escape_control_char(void) {
+    char out[64];
+    /* C 字符串字面量 trap: "a\x01b" 实际是 "a" + char(0x1b)
+     * 因为 \x 后接任意多 hex 字符。用八进制 \001 (最多 3 位) 避开 */
+    json_escape("a\001b", out, sizeof(out));
+    /* 期望 8 字符: a, \, u, 0, 0, 0, 1, b */
+    const char *expected = "a\\u0001b";
+    ASSERT_EQ(expected, out, "control char 0x01 as backslash u 0001 b");
+}
+
+static void test_json_escape_chinese_unchanged(void) {
+    char out[128];
+    json_escape("测试设备", out, sizeof(out));
+    ASSERT_EQ("测试设备", out, "Chinese UTF-8 unchanged");
+}
+
+static void test_json_escape_empty(void) {
+    char out[64];
+    json_escape("", out, sizeof(out));
+    ASSERT_EQ("", out, "empty string unchanged");
+}
+
+static void test_json_escape_truncation_safe(void) {
+    char out[10];
+    /* "a\"b\"c\"d\"e" → 9 chars + NUL,正好刚刚够 */
+    json_escape("aaaaaaaaaa", out, sizeof(out));
+    /* 应该是 "aaaaaaaaa" (9 char + NUL),最后一个 a 被截 */
+    ASSERT_INT_EQ(9, (int)strlen(out), "small buffer truncates safely");
+}
+
 /* === main === */
 
 int main(void) {
@@ -301,6 +397,17 @@ int main(void) {
     test_re_resolve_manual_long_after();
     test_re_resolve_mdns_within_window();
     test_re_resolve_mdns_at_exactly_60();
+
+    printf("\n── json_escape (v3.5.1 P0-2) ──\n");
+    test_json_escape_plain();
+    test_json_escape_double_quote();
+    test_json_escape_backslash();
+    test_json_escape_newline();
+    test_json_escape_tab_cr();
+    test_json_escape_control_char();
+    test_json_escape_chinese_unchanged();
+    test_json_escape_empty();
+    test_json_escape_truncation_safe();
 
     /* 清理 */
     unlink(DEVICE_NAMES_JSON);

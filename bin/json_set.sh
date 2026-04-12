@@ -42,29 +42,53 @@ _short_sleep() {
     sleep 1
 }
 
-# 检测并清除陈旧锁:见 acquire_lock 内部的 force_break 机制
-# (之前用 stat -c %Y 但 Android busybox 不一定有 stat 命令,
-#  改用循环计数法 — 第 20 次重试时如果还卡着就强制清,等价于"卡 2 秒就当陈旧锁")
+# v3.5.1 P0-4 修复:之前 force_break 在 2 秒后无条件 rmdir 锁目录,
+# 不检查持锁进程是否还活着 → 大文件 awk 慢的时候,持锁进程 A 还在工作,
+# 进程 B 强拆锁进入,A 和 B 同时 mv 到 .tmp,JSON 损坏。
+#
+# 修复:锁目录里写持锁 PID,force_break 之前先 kill -0 检查存活,
+# 只有持锁进程已死才强拆。
 
 acquire_lock() {
     local i=0
-    local force_break=20  # 第 20 次重试时(=2 秒)如果还卡着,认为是陈旧锁
+    local force_break=20  # 第 20 次重试时(=2 秒)考虑强拆陈旧锁
     while [ $i -lt 50 ]; do
         if mkdir "$LOCKDIR" 2>/dev/null; then
-            trap 'rmdir "$LOCKDIR" 2>/dev/null' EXIT INT TERM
+            # 成功获取锁,写自己 PID
+            echo $$ > "$LOCKDIR/pid" 2>/dev/null
+            trap 'rmdir "$LOCKDIR/pid" 2>/dev/null; rm -f "$LOCKDIR/pid" 2>/dev/null; rmdir "$LOCKDIR" 2>/dev/null' EXIT INT TERM
             return 0
         fi
-        # 第 20 次重试时如果还在卡(=已经等 2 秒),强制清掉陈旧锁
+        # 第 20 次重试时检查是否真的陈旧
         if [ $i -eq $force_break ]; then
-            rmdir "$LOCKDIR" 2>/dev/null
-            echo "json_set: force-break stale lock at retry $i" >&2
+            local lock_pid
+            lock_pid=$(cat "$LOCKDIR/pid" 2>/dev/null)
+            if [ -z "$lock_pid" ]; then
+                # 锁目录存在但没 PID 文件 — 可能是上一版残留或刚 mkdir 还没 echo
+                # 给一次机会再等一轮,而不是立刻拆
+                _short_sleep
+                i=$((i+1))
+                continue
+            fi
+            if kill -0 "$lock_pid" 2>/dev/null; then
+                # 持锁进程还活着,不拆,继续等
+                echo "json_set: lock held by alive PID $lock_pid, waiting" >&2
+            else
+                # 持锁进程已死,安全强拆
+                echo "json_set: force-break stale lock (dead PID $lock_pid)" >&2
+                rm -f "$LOCKDIR/pid" 2>/dev/null
+                rmdir "$LOCKDIR" 2>/dev/null
+            fi
         fi
         _short_sleep
         i=$((i+1))
     done
     return 1
 }
-release_lock() { rmdir "$LOCKDIR" 2>/dev/null; }
+release_lock() {
+    rm -f "$LOCKDIR/pid" 2>/dev/null
+    rmdir "$LOCKDIR" 2>/dev/null
+}
 
 # ═══════════════════════════════════════════════════════════════
 # v3.3.0 新增：统一的 JSON 值编码函数

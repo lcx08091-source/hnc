@@ -62,6 +62,7 @@
 #define RULES_JSON          HNC_DIR "/data/rules.json"
 #define DEVICE_NAMES_JSON   HNC_DIR "/data/device_names.json"   /* v3.5.0 P0-4 */
 #define MDNS_RESOLVE_BIN    HNC_DIR "/bin/mdns_resolve"         /* v3.5.0 P0-4 */
+#define IPTABLES_MGR        HNC_DIR "/bin/iptables_manager.sh"  /* v3.5.1 P1-2 */
 
 /* ── 设备表 ──────────────────────────────────────────────── */
 #define MAX_DEVICES     128
@@ -228,12 +229,17 @@ static int lookup_manual_name(const char *mac, char *out, size_t outlen) {
     return 0;
 }
 
-/* 调 bin/mdns_resolve <ip> <mac>,超时 1s */
+/* 调 bin/mdns_resolve <ip>,超时 1s
+ * v3.5.1 P0-1 修复:之前传 "<ip> <mac>" 两个位置参数,但 mdns_resolve 的
+ * argv 解析循环把任何非 flag 参数都赋给 ip,结果 ip 被 mac 覆盖,
+ * inet_pton 必然失败,从来没真正发出过 mDNS 查询。
+ * 修复:只传 ip,跟 shell 路径(`mdns_resolve -t 800 "$ip"`)一致 */
 static int try_mdns_resolve(const char *ip, const char *mac, char *out, size_t outlen) {
+    (void)mac;  /* 参数保留以兼容调用方,但不传给 binary */
     if (access(MDNS_RESOLVE_BIN, X_OK) != 0) return 0;
 
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "%s %s %s 2>/dev/null", MDNS_RESOLVE_BIN, ip, mac);
+    snprintf(cmd, sizeof(cmd), "%s -t 800 %s 2>/dev/null", MDNS_RESOLVE_BIN, ip);
 
     FILE *pf = popen(cmd, "r");
     if (!pf) return 0;
@@ -288,7 +294,77 @@ static void resolve_hostname(const char *mac, const char *ip,
 /* ══════════════════════════════════════════════════════════
    JSON 写出（原子 tmp+rename，与原 shell 格式 100% 兼容）
 ══════════════════════════════════════════════════════════ */
+
+/* v3.5.1 P0-2: JSON 字符串转义
+ * 转义 " \ \n \r \t 和 0x00-0x1f 控制字符。
+ * 之前 write_json 用 %s 直接输出 d->hostname,如果 hostname 含 " 或 \(来自
+ * lookup_manual_name 解码 device_names.json),JSON 破损 → WebUI 设备列表清空 */
+static void json_escape(const char *src, char *dst, size_t dst_size) {
+    if (dst_size == 0) return;
+    size_t j = 0;
+    /* 循环条件 j + 1 < dst_size: 留 1 字节给末尾 NUL。
+     * 每个 escape 分支自己再检查需要的额外字节,不够就 break。 */
+    for (size_t i = 0; src[i] && j + 1 < dst_size; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (c == '"' || c == '\\') {
+            if (j + 2 >= dst_size) break;  /* 需要 2 字节 + NUL */
+            dst[j++] = '\\';
+            dst[j++] = (char)c;
+        } else if (c == '\n') {
+            if (j + 2 >= dst_size) break;
+            dst[j++] = '\\'; dst[j++] = 'n';
+        } else if (c == '\r') {
+            if (j + 2 >= dst_size) break;
+            dst[j++] = '\\'; dst[j++] = 'r';
+        } else if (c == '\t') {
+            if (j + 2 >= dst_size) break;
+            dst[j++] = '\\'; dst[j++] = 't';
+        } else if (c < 0x20) {
+            if (j + 6 >= dst_size) break;  /* 需要 6 字节 + NUL */
+            j += snprintf(dst + j, dst_size - j, "\\u%04x", c);
+        } else {
+            /* 普通 ASCII 或多字节 UTF-8 字节,1 字节 */
+            dst[j++] = (char)c;
+        }
+    }
+    dst[j] = '\0';
+}
+
+/* v3.5.1 P1-2: 调 iptables_manager.sh stats_all 读 per-device 流量字节
+ * 之前 hotspotd 模式下 rx_bytes/tx_bytes 永远 0 → WebUI 流量统计完全失效。
+ * 修复:write_json 之前 popen 一次,把输出按 IP 索引,匹配后填充 d->rx_bytes/tx_bytes。
+ * stats_all 输出格式:每行 "<ip> <rx_bytes> <tx_bytes>"
+ * 性能:popen + awk + iptables 一次约 50-100ms。配合 R-1 de-bounce(1s 窗口),
+ * 实际不会比 shell 路径慢 */
+static void update_traffic_stats(void) {
+    if (access(IPTABLES_MGR, X_OK) != 0) return;
+
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "sh %s stats_all 2>/dev/null", IPTABLES_MGR);
+    FILE *pf = popen(cmd, "r");
+    if (!pf) return;
+
+    char line[128];
+    while (fgets(line, sizeof(line), pf) != NULL) {
+        char ip[IP_STR_LEN];
+        long rx, tx;
+        if (sscanf(line, "%15s %ld %ld", ip, &rx, &tx) == 3) {
+            for (int i = 0; i < MAX_DEVICES; i++) {
+                if (g_devs[i].active && strcmp(g_devs[i].ip, ip) == 0) {
+                    g_devs[i].rx_bytes = rx;
+                    g_devs[i].tx_bytes = tx;
+                    break;
+                }
+            }
+        }
+    }
+    pclose(pf);
+}
+
 static void write_json(void) {
+    /* v3.5.1 P1-2: 写 JSON 前先更新流量字节,否则 rx/tx 永远是 0 */
+    update_traffic_stats();
+
     /* 读黑名单
      * v3.5.0 P1-7 修复:之前 fgets(line, 256) 读 rules.json,如果 30+ 设备
      * 全在 blacklist 一行,256 字节装不下 → strstr 检测不到 ']' → 截断丢失。
@@ -329,17 +405,13 @@ static void write_json(void) {
 
     fprintf(f, "{");
     int first = 1;
-    time_t now = time(NULL);
+    /* v3.5.1 P2-6: 删除原 300s 离线判断(死代码)。
+     * 离线清理由主循环 R-13 周期任务负责(每 30s 检查,90s 阈值)。
+     * 之前两个判断并存,300s 永远触发不到(R-13 90s 先清),逻辑不清晰 */
+    (void)0;
     for (int i = 0; i < MAX_DEVICES; i++) {
         Device *d = &g_devs[i];
         if (!d->active) continue;
-
-        /* 超过 300s 未见的条目标记非活跃 */
-        if (now - d->last_seen > 300) {
-            d->active = 0;
-            g_dirty = 1;
-            continue;
-        }
 
         /* 黑名单状态 */
         const char *status = "allowed";
@@ -348,6 +420,10 @@ static void write_json(void) {
 
         /* v3.5.0 P0-4: 输出 hostname_src 字段(默认 mac 兜底) */
         const char *hn_src = (d->hostname_src[0]) ? d->hostname_src : "mac";
+
+        /* v3.5.1 P0-2: hostname 必须 JSON-escape,否则用户名字含 " 或 \ 会破坏 JSON */
+        char hn_escaped[HN_LEN * 6 + 4];  /* worst case: 每字节变 \u00xx */
+        json_escape(d->hostname, hn_escaped, sizeof(hn_escaped));
 
         if (!first) fprintf(f, ",");
         fprintf(f,
@@ -362,7 +438,7 @@ static void write_json(void) {
             "\"status\":\"%s\","
             "\"last_seen\":%ld"
             "}",
-            d->mac, d->ip, d->mac, d->hostname, hn_src,
+            d->mac, d->ip, d->mac, hn_escaped, hn_src,
             d->iface, d->rx_bytes, d->tx_bytes,
             status, (long)d->last_seen);
         first = 0;
@@ -375,7 +451,7 @@ static void write_json(void) {
         hlog("ERROR: rename failed: %s", strerror(errno));
     else {
         count_active();
-        g_last_write = now;
+        g_last_write = time(NULL);
         g_dirty = 0;
         hlog("JSON written: %d device(s)", g_ndev);
     }

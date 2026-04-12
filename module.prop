@@ -1,7 +1,7 @@
 id=hotspot_network_control
 name=Hotspot Network Control
-version=v3.5.0
-versionCode=3503
+version=v3.5.1
+versionCode=3504
 author=Claude (Anthropic AI)
-description=热点设备管控 v3.5.0 正式版 · 工程化主题(测试 91→97 + GitHub Actions CI + hotspotd 生产可用)+ R-1 nl_process de-bounce + R-2 60s re-resolve + R-12 WebUI 离线检测 + R-13 hotspotd 周期清理 + 完整 README/ROADMAP。详见 CHANGELOG.md。
+description=热点设备管控 v3.5.1 紧急修复 · 第三方 AI 安全审查发现 4 个 P0 + 3 个 P1。修:P0-1 mdns 完全失效 + P0-2 hostname JSON 注入 + P0-3 ssid/pass shell 注入 + P0-4 lock race + P1-2 流量字节 0 + P1-7 watchdog PID race + P2-6 死代码。+9 个 P0-2 单元测试(总 106 测试)。详见 CHANGELOG.md。
 minKernelSU=11485

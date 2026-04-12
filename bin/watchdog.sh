@@ -130,8 +130,14 @@ check_services() {
                 log "hotspotd dead but in cooldown (${since}s < ${RESTART_COOLDOWN}s),skip"
             else
                 log "hotspotd dead, restarting (last=${HOTSPOTD_LAST_RESTART})..."
+                # v3.5.1 P1-7 修复:不再 echo $! > pid 文件,因为 hotspotd -d 会
+                # double-fork 后台化,$! 是 shell 子进程 PID,不是真 hotspotd PID。
+                # hotspotd 自己会 write_pid() 写真 PID 到 /data/local/hnc/run/hotspotd.pid。
+                # 之前两个写法竞争同一文件,可能存的是错的 PID,导致下次 kill -0 失败,
+                # 触发重启风暴(虽然有 60s cooldown 兜底,但根本上不该有这个 race)。
                 "$HNC_DIR/bin/hotspotd" -d >> "$HNC_DIR/logs/hotspotd.log" 2>&1 &
-                echo $! > "$RUN/hotspotd.pid"
+                # 等 hotspotd 自己写 PID 文件(通常 < 100ms)
+                sleep 1
                 HOTSPOTD_LAST_RESTART=$now
                 restarted=1
             fi
