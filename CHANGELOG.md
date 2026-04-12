@@ -484,6 +484,33 @@ if (truncated || (src[0] && j + 1 >= dst_size)) {
 
 ---
 
+### 🔍 第三轮 AI 审查结论(2026-04-13 凌晨)
+
+v3.5.2 打包完成后我做了**第三轮独立 AI 代码审查**。审查员读了 hotspotd.c(1071 行)、mdns_resolve.c(445 行)、所有 10 个 shell 脚本、webroot 的 action 函数、service.sh、post-fs-data.sh。
+
+**结论:**
+
+> *"这个版本我没找到会影响真实用户的真 bug。打 tag,发 release。"*
+
+- **真 P0**: 0 个
+- **真 P1**: 0 个
+- **技术债**: 12 个(T1-T12,归入 v3.6 backlog,见 ROADMAP.md)
+- **风格建议**: 6 条
+
+审查员走了 P0-A 三层防御的完整回归 + write_pid O_EXCL race 窗口 + REFRESH/TTL 交互 + spawn 锁生命周期 + mdns_resolve 边界 + webroot XSS/注入向量 + 长跑 fd/内存,**所有路径都验证闭合**。
+
+**审查员的元建议**(我完全同意):
+
+1. **打 tag v3.5.2,发第一个 GitHub Release** — 继续审 v3.5 的边际收益已经小于启动 v3.6 的价值
+2. **v3.6 拆成 v3.6.0 + v3.6.1**: 前者做 P0-B 核心修复 + helper 提取 + 技术债清理,后者做 BPF / hardware offload 研究
+3. **写 HACKING.md** 把隐性知识落地(MARK_BASE 避让范围、rules.json 单行约束、KSU kexec 限制等)
+
+**v3.5 系列审查到此结束**。下一次 AI 审查是 v3.6.0 并发模型改完之后(work queue / 后台线程)。
+
+**坐标**: 审查员评价 v3.5.2 在"单人维护的 Android root 模块"这个细分领域里是它见过的最高质量。这不是恭维,是三轮 adversarial audit 的独立证据链 — 前两轮找到真 P0 是因为真的存在,第三轮找不到真 P0 是因为 v3.5.2 真的到了新的稳态。
+
+---
+
 ## 🚨 v3.5.1 紧急修复版 · 2026-04-12
 
 > **第三方 AI 代码安全审查发现 4 个 P0 + 3 个 P1**。v3.5.0 存在一个 catastrophic bug — 整个 P0-4 修复实际上从未生效(mDNS 一次都没真正发出过)。v3.5.1 修了所有 P0/P1,**v3.5.0 不应作为 release**,直接被 v3.5.1 替代。

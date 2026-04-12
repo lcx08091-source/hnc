@@ -1,22 +1,159 @@
 # HNC ROADMAP
 
-最后更新:2026-04-12
+最后更新:2026-04-13
 
 ---
 
 ## 当前状态
 
-**HNC v3.5.0 正式版已发布** 🎉
+**HNC v3.5.2 架构修复版已发布** 🎉
+
+经过**三轮独立 AI 代码审查**,v3.5.2 是 v3.5 系列第一个**可以作为 GitHub Release 发布**的版本。
 
 | 版本 | 状态 | 主题 |
 |---|---|---|
 | v3.4.10 | ✅ LTS | 长期支持(只修 bug) |
 | v3.5.0-alpha | ✅ Released | 测试框架(64 shell tests) |
 | v3.5.0-beta1 | ✅ Released | hotspotd 4 修 + CI + benchmark |
-| v3.5.0-rc | ✅ Released | de-bounce + re-resolve + README + ROADMAP |
-| **v3.5.0** | ✅ **Released** | **R-12 WebUI offline + R-13 周期清理 + 工程化主题完成** |
-| v3.5.x patch | ⏳ 按需 | 长跑发现的 bug 修复 |
-| v3.6 | ⏳ 待立项 | 等 v3.5 收集 feedback 后规划 |
+| v3.5.0-rc | ✅ Released | de-bounce + re-resolve + README |
+| v3.5.0 | ❌ **DEPRECATED** | 第一轮 AI 审查发现 4 个 P0 |
+| v3.5.1 | ❌ **DEPRECATED** | 第二轮 AI 审查发现 P0-A 架构 race |
+| **v3.5.2** | ✅ **Released** | **daemon 生命周期架构成熟** |
+| v3.6.0 | ⏳ 规划中 | P0-B 核心修复 + helper 提取 + 技术债清理 |
+| v3.6.1 | ⏳ 规划中 | BPF / hardware offload 研究 |
+
+### 三轮审查结果总览
+
+| 轮次 | 真 P0 | 真 P1 | 结论 |
+|---|---|---|---|
+| 第一轮 (v3.5.0) | 4 个 | 3 个 | 注入 / 转义 / race / 失效 |
+| 第二轮 (v3.5.1) | 2 个 | 5 个 | watchdog 双重复活 + IPC DoS |
+| **第三轮 (v3.5.2)** | **0 个** | **0 个** | **只找到技术债,建议 stop auditing** |
+
+第三轮审查员结论:*"打 tag v3.5.2,发第一个 GitHub Release,开始规划 v3.6。不需要修 v3.5.3。继续打磨 v3.5 的边际收益已经小于启动 v3.6 的价值。"*
+
+---
+
+## v3.5.2 已知技术债(第三轮审查整理,归入 v3.6 backlog)
+
+这些是第三轮审查发现的问题,**全部不是会影响真实用户的真 bug**,而是"要构造特定场景才会出问题"的边角,或"哪天生态变了会成为真问题"的风险。按审查员判断的价值从高到低排列:
+
+### 高价值(v3.6.0 优先做)
+
+**T1 — shell 参数注入的 defense-in-depth 缺失** [中高]
+- 位置: `webroot/index.html` applyLimit 4263 / clearLimit 4323 / applyDelay 4346 / addBlacklist 4404 / rmBlacklist 4415 / shUpdate 4180
+- 现状: 6 个 action 函数把 ip / mac 插进双引号而不是用 shellQuote()
+- 当前不触发原因: hotspotd.c 的 /proc/net/arp sscanf + netlink snprintf 对 mac/ip 有硬格式约束
+- 风险: 下次加新数据源(离线命名导入 / nmap 扫描)这个前提会失效
+- 修复: 把所有 kexec 的 ip/mac 插值改成 shellQuote(),v3.5.1 的 editName 已经用这个模式,6 个 action 跟上即可
+- 工时: 30 分钟
+
+**T2 — REFRESH + update_traffic_stats TTL 交互的 UX 钝感** [中]
+- 位置: `daemon/hotspotd.c:427 / 802-807`
+- 现状: REFRESH 异步化后,下一次 scan_arp → write_json 如果在 5 秒 TTL 窗口内,devices.json 的 rx/tx 是旧数据
+- 实际影响: 背景 doRefresh 每 2.5 秒跑一次,用户感知不到
+- 修复: REFRESH 分支额外设 `g_last_stats_update = 0` 强制下次重算,2 行代码
+
+**T3 — watchdog spawn 锁缺少陈旧恢复** [中]
+- 位置: `bin/watchdog.sh:154-159`
+- 现状: device_detect.sh daemon_mode() 有 10 秒 force-break,但 watchdog 的 spawn 锁没有
+- 触发条件: watchdog 自己在 mkdir/rmdir 之间的 1 秒窗口被 SIGKILL(极罕见)
+- 修复: 把 device_detect.sh 的 force-break 逻辑抽成 `bin/lib_spawn.sh`,两处共用
+
+**T4 — daemon_mode() 注释说 trap 但实际没写 trap** [低]
+- 位置: `bin/device_detect.sh:469-471`
+- 现状: 注释写"trap 确保进程退出时释放 spawn 锁"但下面没有 trap 语句
+- 性质: 注释和代码对不上,诚实问题。实际依赖 force-break 兜底
+- 修复: 要么补 trap,要么改注释说"依赖 force-break 兜底,trap 在 ash 下不可靠"
+
+### 中价值
+
+**T5 — cfg_set 对空 {} 插入字段产生非法 JSON** [低]
+- 位置: `bin/json_set.sh:374`
+- 现状: `sed -i "s|}$|,\"$KEY\": $JVAL}|"` 对空 `{}` 产生 `{,"key": val}`(前置逗号非法)
+- 当前不触发原因: config.json 默认非空(5 个字段)
+- 触发条件: 有人手动删 config.json 后 `echo '{}' > config.json` 初始化
+- 修复: 先判断是否空对象
+
+**T6 — webroot 有两个 devIcon 函数** [低]
+- 位置: `webroot/index.html:3079-3085` (emoji) vs `4121-4125` (SVG)
+- 现状: 第二个覆盖第一个,第一个是死代码
+- 修复: 删第 3079-3085
+
+**T7 — restore_rules 隐式依赖 rules.json 单行格式** [中]
+- 位置: `bin/tc_manager.sh:593`
+- 现状: restore_rules 的 awk 在单行 $0 上扫设备块
+- 风险: 如果有人用 jq 格式化 rules.json,awk 抽不出 mark_id 导致 restore 静默失败
+- **这个隐性约束没写在任何文档里** — 也会在 HACKING.md 里记录
+- 修复选项: (a) 检测多行 + tr -d '\n' 临时压缩 / (b) awk 跨行模式 / (c) 文档警告
+
+**T8 — 日志轮转只在启动时触发** [中]
+- 位置: `post-fs-data.sh:87-100`
+- 现状: 10MB 阈值 + 只在启动时检查。长跑几个月不重启理论上无上限
+- 实际影响: hlog 克制,10MB ≈ 数十万条记录,满负载也要一两个月
+- 修复: hotspotd.c 加 runtime rotation,hlog 写前 ftell 超 10MB 就 rotate
+
+**T12 — watchdog check_services 每 3 轮才调用** [中]
+- 位置: `bin/watchdog.sh:252-257`
+- 现状: INTERVAL_NORMAL=60 × 每 3 轮 = 180 秒,hotspotd 崩溃后最多 3 分钟 watchdog 才重启
+- 修复: 删 `% 3`,每轮都调 check_services。代价极小(几次 cat + kill -0)
+
+### 低价值 / 可观察
+
+- **T9** — get_rule_str 对 SSID 含 `"` 的处理不完整(grep 的 `[^"]*` 不懂 `\"` escape)
+- **T10** — handle_client recv 单次 64 字节(当前命令都 < 16,未来扩展要记得调大)
+- **T11** — stats_all 解析 iptables -nvx 字段位置固定(跨版本可能变,尤其 iptables-nft)
+
+### 风格 / 建议
+
+- `hotspotd.c:961` 注释写 "200ms de-bounce" 但实际 `tv.tv_sec = 1`(1 秒)
+- `iptables_manager.sh:69` log 时间戳不带日期
+- `watchdog.sh` 日志标签还写 "v3.4.1 started",没跟着升
+- CHANGELOG 已经接近 200KB,考虑归档历史版本到 CHANGELOG-archive.md
+- module.prop description 字段可以短一点(Android root manager UI 会截断)
+
+---
+
+## v3.6 规划(基于第三轮审查员的优先级建议)
+
+### v3.6.0 — 架构修复完结 + 技术债清理
+
+审查员原话: *"v3.6 最应该做的 3 件事是 P0-B 剩余修复 + 安全补强 + helper 提取"*
+
+1. **P0-B 核心修复** — scan_arp 内部 popen mdns_resolve 的同步阻塞
+   - 当前: v3.5.2 只修了 IPC 路径,scan_arp 里仍然串行 popen 每个设备的 mdns
+   - 方案候选: (a) work queue + 独立工作线程 / (b) fork 短命子进程 + waitpid WNOHANG / (c) scan_arp 只填 mac 兜底标 `pending`,下次 write_json 之间异步解析
+   - 优先级: v3.6.0 必做(v3.5.2 CHANGELOG 已承诺)
+
+2. **helper 提取为 hnc_helpers.c/.h**
+   - 当前: test_hostname_helpers.c 里 `should_re_resolve` 和 `json_escape` 依然是从 hotspotd.c 复制的(v3.5.2 P1-A 修了签名对齐,但没拆文件)
+   - 方案: 提取 daemon/hnc_helpers.c + .h,主代码和测试都 #include
+   - 消除: v3.5.1 P1-3 和 v3.5.2 P1-A 留下的复制 drift 风险
+
+3. **技术债清理**: T1 + T2 + T4 + T6 + T12(都是 30 分钟内能修的小事)
+
+### v3.6.1 — BPF / hardware offload 研究
+
+- RMX5010 实测 BPF tether_limit_map 可写但 tc clsact 优先级高于 schedcls
+- 保留为 `tools/` 紧急工具,不集成进主模块
+- 其他芯片/内核组合的调研
+
+---
+
+## 项目可持续性(第三轮审查员的元建议)
+
+> *"真正可能把它杀掉的不是代码,是你某天不想维护了。"*
+
+为提高项目可持续性:
+
+1. **v3.6 拆成 v3.6.0 + v3.6.1**,别一次吞下所有(P0-B + helper + BPF 是三个独立里程碑)
+2. **写 HACKING.md** — 把隐性知识落地:
+   - `MARK_BASE` 必须避开 netd 的 `0x10000-0xdffff` 范围(v3.4.1 事故)
+   - `rules.json` 必须保持单行 devices 段(T7 的隐性约束)
+   - `post-fs-data.sh` 阶段 iptables 可能还没 ready
+   - KSU kexec 的 callback 必须是 global function string(不是匿名函数)
+   - Android 16 / SD8 Elite 的 `clsact` 要用 `ffff:fff2` handle
+3. **在 README 或 module.prop 加运维 tip** — "如果 hotspotd 行为异常,先看 `/data/local/hnc/run/daemon.spawn` 目录存不存在"
 
 ---
 
