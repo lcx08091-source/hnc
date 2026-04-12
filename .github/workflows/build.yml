@@ -1,0 +1,131 @@
+name: Build HNC
+
+# v3.5.0-beta1: 自动 CI/CD
+
+on:
+  push:
+    branches: [main, dev]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  NDK_VERSION: r26d
+  TARGET_API: 30
+  TARGET_ABI: arm64-v8a
+
+jobs:
+  test:
+    name: Run unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run shell unit tests
+        run: |
+          sh test/run_all.sh
+
+      - name: Compile and run C unit tests
+        run: |
+          cd daemon/test
+          gcc -Wall -Wextra -o test_mdns_parse test_mdns_parse.c
+          ./test_mdns_parse
+          gcc -Wall -Wextra -o test_hostname_helpers test_hostname_helpers.c
+          ./test_hostname_helpers
+
+  build:
+    name: Cross-compile binaries
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache NDK
+        id: cache-ndk
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ndk
+          key: ndk-${{ env.NDK_VERSION }}
+
+      - name: Setup NDK
+        if: steps.cache-ndk.outputs.cache-hit != 'true'
+        run: |
+          NDK_DIR="${{ runner.temp }}/ndk"
+          mkdir -p "$NDK_DIR"
+          cd "$NDK_DIR"
+          NDK_ZIP="android-ndk-${NDK_VERSION}-linux.zip"
+          wget -q "https://dl.google.com/android/repository/${NDK_ZIP}"
+          unzip -q "$NDK_ZIP"
+          rm "$NDK_ZIP"
+
+      - name: Setup environment
+        run: |
+          NDK_ROOT="${{ runner.temp }}/ndk/android-ndk-${NDK_VERSION}"
+          TOOLCHAIN="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64"
+          echo "NDK_ROOT=$NDK_ROOT" >> $GITHUB_ENV
+          echo "TOOLCHAIN=$TOOLCHAIN" >> $GITHUB_ENV
+          echo "CC=$TOOLCHAIN/bin/aarch64-linux-android${TARGET_API}-clang" >> $GITHUB_ENV
+          echo "STRIP=$TOOLCHAIN/bin/llvm-strip" >> $GITHUB_ENV
+
+      - name: Cross-compile hotspotd (arm64-v8a static)
+        run: |
+          $CC \
+            -O2 \
+            -Wall -Wextra -Wno-unused-parameter \
+            -static \
+            -o bin/hotspotd \
+            daemon/hotspotd.c
+          $STRIP bin/hotspotd
+          file bin/hotspotd
+          ls -lh bin/hotspotd
+
+      - name: Cross-compile mdns_resolve (arm64-v8a static)
+        run: |
+          $CC \
+            -O2 \
+            -Wall -Wextra \
+            -static \
+            -o bin/mdns_resolve \
+            daemon/mdns_resolve.c
+          $STRIP bin/mdns_resolve
+          file bin/mdns_resolve
+          ls -lh bin/mdns_resolve
+
+      - name: Read version from module.prop
+        id: version
+        run: |
+          VERSION=$(grep '^version=' module.prop | cut -d= -f2)
+          VERSION_CODE=$(grep '^versionCode=' module.prop | cut -d= -f2)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "versionCode=$VERSION_CODE" >> $GITHUB_OUTPUT
+          echo "Building $VERSION ($VERSION_CODE)"
+
+      - name: Package KSU module zip
+        run: |
+          ZIP_NAME="HNC-${{ steps.version.outputs.version }}-arm64.zip"
+          zip -qr "$ZIP_NAME" . \
+            -x "*.git*" \
+            -x "*.github/*" \
+            -x "*test_mdns_parse" \
+            -x "*test_hostname_helpers" \
+            -x "*.o" \
+            -x "*.DS_Store"
+          ls -lh "$ZIP_NAME"
+          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+
+      - name: Upload module zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HNC-${{ steps.version.outputs.version }}-arm64
+          path: ${{ env.ZIP_NAME }}
+          retention-days: 30
+
+      - name: Upload binaries artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hnc-binaries-${{ steps.version.outputs.version }}
+          path: |
+            bin/hotspotd
+            bin/mdns_resolve
+          retention-days: 30
