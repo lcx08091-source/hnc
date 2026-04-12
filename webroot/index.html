@@ -1430,10 +1430,40 @@ html,body { min-height:100%; background:var(--bg); color:var(--t0); font-family:
         <div class="about-name">HNC · Hotspot Network Control</div>
         <div class="about-author">作者：Claude (Anthropic AI) &nbsp;·&nbsp; KSU / Magisk 模块</div>
       </div>
-      <span class="about-ver">v3.5.0-beta1</span>
+      <span class="about-ver">v3.5.0-rc</span>
     </div>
     <!-- 更新日志 -->
     <div class="changelog">
+
+      <!-- v3.5.0-rc 收尾 + polish（默认展开）-->
+      <div class="cl-item">
+        <div class="cl-left">
+          <div class="cl-dot"></div>
+          <div class="cl-line"></div>
+        </div>
+        <div class="cl-right">
+          <div class="cl-title">v3.5.0-rc 收尾 + polish &nbsp;<span style="font-size:11px;color:var(--t2);font-weight:400">2026-04-12</span></div>
+          <div class="cl-tags">
+            <span class="cl-tag feat" style="background:#7c3aed;color:#fff">v3.5 rc</span>
+            <span class="cl-tag feat">de-bounce</span>
+            <span class="cl-tag feat">re-resolve fix</span>
+            <span class="cl-tag feat">README + ROADMAP</span>
+          </div>
+          <ul class="cl-changes">
+            <li><b>🎯 v3.5.0-rc = 收尾 + polish + 工程化文档完善</b>。这是 v3.5 的最后一个 pre-release。beta1 在真机上发现的两个 bug 修了,加了 ROADMAP / README,准备进入 v3.5.0 final</li>
+            <li><b>🔧 R-1 hotspotd nl_process 1s de-bounce</b>:beta1 真机暴露的性能 bug — 同一台设备 5 秒内 6+ 次 state transition,每次都 write_json,文件 IO 风暴。修复:nl_process 不再立即写,只设 dirty + 事件时间戳;主循环判断"距上次事件 ≥ 1 秒"或"距首次 dirty ≥ 30 秒(强制兜底)"才写。预期写入 IO 减少 80%+</li>
+            <li><b>🔧 R-2 60s 时间窗口 re-resolve</b>:beta1 真机暴露的功能 bug — 改名场景下 hotspotd 不更新设备名(只在 hostname_src == "mac" 时重试)。修复:Device struct 加 last_resolve 字段,re-resolve 触发条件改为 <code>mac 兜底 || (now - last_resolve) >= 60</code>。改名后最多 60 秒生效(实际通常 < 10 秒)</li>
+            <li><b>🧪 6 个新 C 单元测试</b>:test_hostname_helpers.c 加 6 个 R-2 测试覆盖 mac 兜底立即重试 / manual 60s 内不重试 / manual 60s 后重试 / 5 分钟后重试 / mdns 59s 边界 / mdns 60s 边界。<b>总测试数从 91 → 97</b></li>
+            <li><b>📚 R-5 README.md 完整重写</b>:之前是 v3.4.10 LTS 时代的 README,只讲 LTS 维护期。现在反映 v3.5 是工程化主题版本(测试 / CI / hotspotd 生产可用),v3.5 vs v3.4.10 LTS 选择指引,完整开发流程,故障排查含 R-1 R-2 修复说明</li>
+            <li><b>📚 R-6 ROADMAP.md(全新)</b>:第一个版本的 ROADMAP — 当前状态 / v3.5.0-rc 任务清单 / v3.5.0 final 任务 / v3.6 候选主题(nftables 后端、流量历史图、设备上线通知、流量配额、多 root 框架、主题市场、WebUI i18n,<b>都是占位想法没有具体规划</b>)/ 不做的事(VPN/代理/广告拦截/防火墙 GUI/DNS,明确 scope 边界)</li>
+            <li><b>🔧 R-3 device_detect.sh 警告更新</b>:删除 30 行 "v3.4.11 hotspotd 不要启用,有 4 个 P0/P1 bug" 的过时警告(beta1 全修了),改成 "v3.5.0+ hotspotd C daemon 已启用,生产可用" 的状态说明</li>
+            <li><b>🧪 R-4 smoke test 期望翻转</b>:之前期望 hotspotd 不在跑(基于 LTS 期认知),现在期望 hotspotd 在跑 + 验证 comm 是 hotspotd + 验证启动参数 -d(P1-2 修复)+ 新增 [4b] section 验证 devices.json 含 hostname_src 字段(P0-4 修复证据)</li>
+            <li><b>📦 修改文件</b>:module.prop(v3.5.0-rc / 3502)+ webroot/index.html(本段)+ bin/diag.sh(版本)+ daemon/hotspotd.c(R-1 + R-2 ~50 行新代码)+ daemon/test/test_hostname_helpers.c(6 测试)+ bin/device_detect.sh(R-3)+ hnc_smoke_test.sh(R-4)+ <b>新建</b> README.md + <b>新建</b> ROADMAP.md + CHANGELOG.md</li>
+            <li><b>🎯 v3.5.0-rc → final 还剩</b>:R-10 真机装 rc CI artifact 跑 smoke test 验证修复(你做)+ R-11 24 小时长跑稳定性测试(你做)+ F-1 修长跑 bug + F-2 GitHub Release Notes + F-3 打 tag v3.5.0 触发 CI release</li>
+            <li><b>💭 v3.5.0-rc 的真实价值</b>:beta1 是"工程化奠基"的高潮,rc 是"工程化收尾"的清理。没有戏剧性新功能,但<b>让 v3.5 真正达到 release 级别的成熟度</b></li>
+          </ul>
+        </div>
+      </div>
 
       <!-- v3.5.0-beta1 hotspotd 修复 + CI（默认展开）-->
       <div class="cl-item">
@@ -1450,7 +1480,7 @@ html,body { min-height:100%; background:var(--bg); color:var(--t0); font-family:
             <span class="cl-tag feat">CI/CD</span>
           </div>
           <ul class="cl-changes">
-            <li><b>🔧 v3.5.0-beta1 = hotspotd 修复 + GitHub CI + benchmark</b>。alpha 完成了"测试框架"主题,beta1 完成了"hotspotd 工程化"主题。但 hotspotd <b>仍然没有默认启用</b> — 启用留给 beta2,beta1 是为启用做准备的全部基础设施工作</li>
+            <li><b>🔧 v3.5.0-beta1 = hotspotd 修复 + GitHub CI + benchmark</b>。alpha 完成了"测试框架"主题,beta1 完成了"hotspotd 工程化"主题</li>
             <li><b>🔧 hotspotd C 4 个 bug 修复</b>:(A-1 P0-4) 加 lookup_manual_name + try_mdns_resolve + resolve_hostname,scan_arp/nl_process 用统一路径,write_json 输出 hostname_src 字段,优先级 manual > mdns > mac (A-2 P1-7) 黑名单读取从 fgets(256) 改成 fread(16384),不再截断 30+ 设备的 blacklist (A-3 P1-8) Device struct 加 hostname_src[12],MAC 兜底严格按 shell 算法实现(去冒号取后 8 字符)(A-4 P1-2 已在 alpha) hotspotd 启动参数 --daemon → -d</li>
             <li><b>🧪 跨语言测试框架</b>:新建 daemon/test/test_hostname_helpers.c — 16 个 C 单元测试覆盖 lookup_manual_name(空文件/中文/多 entry/missing/case/escape)+ mac_fallback(标准/短/无冒号)。设计原则:复制 hotspotd.c helper 函数到测试文件(必须保持同步),沙箱 gcc 直接编译运行</li>
             <li><b>🛡 P1-9 mDNS 安全测试</b>:test_mdns_parse.c 新增 3 个 P1-9 测试 — test_rname_validation_match(匹配接受)+ test_rname_validation_mismatch(<b>关键!伪造攻击被拒</b>)+ test_rname_validation_case_insensitive。<b>这是 HNC 历史上第一次有"主动安全测试"</b>,保证 P1-9 修复永远不会被回归。原 8 个测试 + 3 个新测试 = 11/11 全过</li>
@@ -1482,13 +1512,13 @@ html,body { min-height:100%; background:var(--bg); color:var(--t0); font-family:
             <li><b>🏆 测试框架第一次工作就发现 2 个真 bug</b>:(1) v3.4.11 P0-3 set_delay 入口未修干净 — `if gt0 delay_ms` 让 loss-only 走 else 分支被清零 (2) v3.4.11 P0-6 name_set 在某些 awk 实现下 `close("/dev/stdin")` 段错误。这两个 bug 在 v3.4.11 + v3.4.12 实际发布版本里都存在,潜伏 2 个版本,只在测试框架跑通的同一天就被自动抓到</li>
             <li><b>🧪 64 个单元测试全部通过</b>:`test/lib.sh` 提供 assertion + mock 命令机制 + 隔离环境(`/tmp/hnc_test_$$`),`test/run_all.sh` 5-10 秒出红绿结果。覆盖 framework 自检 15 + json_set.sh 30(全部命令 + 边界 + 并发) + iptables_manager + tc_manager 19(关键路径 + v3.4.12 clsact 回归)</li>
             <li><b>🔧 9 项 P2 polish</b>:(P2-1) 所有 log() 函数路径不存在时优雅退化 (P2-2) ensure_device_class jitter 解析防御 (P2-3) device_detect 临时文件 trap 清理 (P2-4) watchdog 重启风暴 60s cooldown (P2-5) cleanup 清理 v3.5 新临时文件 (P2-6) 启动时日志轮转 >10MB (P2-7) esc() undefined/null safe (P2-8/9 验证非 bug,跳过) (P1-2 顺手) hotspotd 启动参数 `--daemon` → `-d`</li>
-            <li><b>🛡 P1-9</b>:mDNS rname 验证 — 之前 multicast 模式下任何设备可广播假 PTR 应答欺骗 HNC,新版 `parse_response` 验证 rname 必须是 `<reversed-ip>.in-addr.arpa` 格式才接受。<b>注意</b>:P1-9 改的是 .c 源码,zip 里的 binary 还是 v3.4.12 旧版,需要 v3.5.0-beta1 通过 GitHub Actions CI 自动 build 才生效</li>
+            <li><b>🛡 P1-9</b>:mDNS rname 验证 — 之前 multicast 模式下任何设备可广播假 PTR 应答欺骗 HNC,新版 `parse_response` 验证 rname 必须是 `<reversed-ip>.in-addr.arpa` 格式才接受。<b>注意</b>:P1-9 改的是 .c 源码,zip 里的 binary 还是 v3.4.12 旧版,需要 v3.5.0-beta1+ 通过 GitHub Actions CI 自动 build 才生效</li>
             <li><b>🚀 C-4 verification step</b>:applyLimit 后异步检查 ifb0 上 class 1:N 的 Sent bytes,5 秒后再采样,如果 delta == 0 且设备明明有上传(devs[].tx_bytes > 1KB),toast 警告"上传限速可能未生效"。<b>这是为了防止再有 v3.4.12 clsact 那种 silent fail 11 个版本</b> — 哪怕未来又引入类似 bug,verification 会立刻警告</li>
             <li><b>⚡ C-5 shUpdate 5→1 kexec 合并</b>:之前 applyLimit 调 shUpdate 时,前端逐字段调 5 次 kexec,每次 ~100ms,串行 ~500ms。新版构建一段 shell `&&` 串联 5 个字段,1 次 kexec 跑完,延迟降到 ~100ms。<b>5x 提升</b></li>
             <li><b>🛤 0-1 PATH 健壮性</b>:所有 bin/*.sh + service.sh + post-fs-data.sh 头部加 `export PATH=/system/bin:/system/xbin:/vendor/bin:$PATH`。Android 真机:把系统路径放最前,user app 的 awk/sed/grep 不会劫持 HNC。Linux 测试沙箱:`$PATH` 兜底</li>
             <li><b>📦 HNC 环境变量 override</b>:所有 bin/*.sh 的 `HNC_DIR=/data/local/hnc` 改成 `HNC_DIR=${HNC_DIR:-/data/local/hnc}`。环境变量优先,默认值兜底。真机 0 行为变化,测试可以隔离运行</li>
             <li><b>📌 修改文件汇总</b>:`module.prop` + `webroot/index.html`(esc/verify/shUpdate/about-ver) + `bin/json_set.sh`(name_set 段错误) + `bin/tc_manager.sh`(P0-3 完整 + log + jitter + HNC_DIR) + `bin/iptables_manager.sh` + `bin/device_detect.sh`(log + tmp trap + HNC_DIR) + `bin/watchdog.sh`(cooldown + -d + log) + `bin/cleanup.sh`(scan tmp) + `bin/v6_sync.sh` + `bin/hotspot_autostart.sh` + `bin/check_offload.sh` + `bin/diag.sh`(版本) + `service.sh` + `post-fs-data.sh`(日志轮转) + `daemon/mdns_resolve.c`(P1-9) + `test/`(整个新目录) + `CHANGELOG.md`</li>
-            <li><b>🚦 升级注意</b>:完全无 break 改动,从 v3.4.12 直接覆盖即可。数据完全保留。`mdns_resolve` binary 还是 v3.4.12 旧版(沙箱无 NDK),P1-9 修复在 v3.5.0-beta1 通过 CI build 后才真正生效。可以 `cd /data/local/hnc && sh test/run_all.sh` 验证你环境上 64/64 是否全过</li>
+            <li><b>🚦 升级注意</b>:完全无 break 改动,从 v3.4.12 直接覆盖即可。数据完全保留。`mdns_resolve` binary 还是 v3.4.12 旧版(沙箱无 NDK),P1-9 修复在 v3.5.0-beta1+ 通过 CI build 后才真正生效。可以 `cd /data/local/hnc && sh test/run_all.sh` 验证你环境上 64/64 是否全过</li>
             <details class="cl-tech">
               <summary>v3.5 路线图(供参考)</summary>
               <ul>

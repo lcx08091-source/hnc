@@ -1,7 +1,7 @@
 id=hotspot_network_control
 name=Hotspot Network Control
-version=v3.5.0-beta1
-versionCode=3501
+version=v3.5.0-rc
+versionCode=3502
 author=Claude (Anthropic AI)
-description=热点设备管控 v3.5.0 beta1 · hotspotd 4 bug 修复(P0-4 hostname 解析 + P1-7 黑名单截断 + P1-8 hostname 长度对齐 + P1-2 watchdog -d)+ daemon C 单元测试 16/16 + mdns_parse P1-9 测试 11/11 + GitHub Actions CI + 真机 benchmark 脚本。hotspotd 仍未默认启用(beta2 启用)。详见 CHANGELOG.md。
+description=热点设备管控 v3.5.0 rc · R-1 hotspotd nl_process 1s de-bounce + R-2 60s 时间窗口 re-resolve(改名 bug 修复)+ R-3 device_detect.sh 警告更新 + R-4 smoke test 期望翻转 + R-5 README 重写 + R-6 ROADMAP + 6 个新 C 测试(总 97 个)。详见 CHANGELOG.md。
 minKernelSU=11485

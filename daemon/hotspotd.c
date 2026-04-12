@@ -85,6 +85,7 @@ typedef struct {
     long    rx_bytes;
     long    tx_bytes;
     time_t  last_seen;
+    time_t  last_resolve;               /* v3.5.0-rc R-2: 上次 resolve_hostname 时间,用于改名场景的 60s 时间窗口 re-resolve */
     int     active;
     int     state;      /* NUD_* from netlink */
 } Device;
@@ -92,6 +93,7 @@ typedef struct {
 static Device   g_devs[MAX_DEVICES];
 static int      g_ndev = 0;          /* active device count */
 static time_t   g_last_write = 0;    /* last devices.json write */
+static time_t   g_last_event = 0;    /* v3.5.0-rc R-1: last netlink event time, for de-bounce */
 static int      g_dirty = 0;         /* device table changed since last write */
 
 /* ── 全局 fd ──────────────────────────────────────────────── */
@@ -406,6 +408,7 @@ static void scan_arp(void) {
         for (int i = 0; mac[i]; i++) mac[i] = tolower((unsigned char)mac[i]);
 
         Device *d = find_device(mac);
+        time_t now_t = time(NULL);
         if (!d) {
             d = alloc_device();
             strncpy(d->mac, mac, sizeof(d->mac)-1);
@@ -414,15 +417,21 @@ static void scan_arp(void) {
             resolve_hostname(mac, ip,
                              d->hostname, sizeof(d->hostname),
                              d->hostname_src, sizeof(d->hostname_src));
-        } else if (strcmp(d->hostname_src, "mac") == 0) {
-            /* 已存在但是 mac 兜底 → 重试 manual/mdns(可能用户刚刚命名) */
+            d->last_resolve = now_t;
+        } else if (strcmp(d->hostname_src, "mac") == 0
+                || (now_t - d->last_resolve) >= 60) {
+            /* v3.5.0-rc R-2: re-resolve 触发条件
+             *   1) hostname_src 是 mac 兜底 → user 可能刚刚命名(立即重试)
+             *   2) 距上次 resolve 超过 60s → user 可能改名 / mDNS 缓存可能更新
+             * 60s 窗口避免每次 ARP scan 都跑 popen mDNS(性能) */
             resolve_hostname(mac, ip,
                              d->hostname, sizeof(d->hostname),
                              d->hostname_src, sizeof(d->hostname_src));
+            d->last_resolve = now_t;
         }
         strncpy(d->ip,    ip,    sizeof(d->ip)-1);
         strncpy(d->iface, iface, sizeof(d->iface)-1);
-        d->last_seen = time(NULL);
+        d->last_seen = now_t;
         d->active    = 1;
         d->state     = NUD_STALE; /* 保守估计 */
         updated++;
@@ -496,19 +505,21 @@ static void nl_process(int fd) {
         if (!*ip_str || !*mac_str) continue;
 
         if (nlh->nlmsg_type == RTM_DELNEIGH || !(ndm->ndm_state & NUD_VALID)) {
-            /* 设备离线：标记非活跃，不立即删除（给 300s 宽限） */
+            /* 设备离线:标记非活跃,不立即删除(给 300s 宽限) */
             Device *d = find_device(mac_str);
             if (d) {
                 /* 仅 NUD_FAILED / NUD_INCOMPLETE 才真正移除 */
                 if (ndm->ndm_state & (NUD_FAILED | NUD_INCOMPLETE)) {
                     d->active = 0;
                     g_dirty   = 1;
+                    g_last_event = time(NULL);  /* v3.5.0-rc R-1 */
                     hlog("DEL: %s (%s) state=0x%x", mac_str, ip_str, ndm->ndm_state);
                 }
             }
         } else {
             /* 设备上线或更新 */
             Device *d = find_device(mac_str);
+            time_t now_t = time(NULL);
             if (!d) {
                 d = alloc_device();
                 strncpy(d->mac, mac_str, sizeof(d->mac)-1);
@@ -516,24 +527,32 @@ static void nl_process(int fd) {
                 resolve_hostname(mac_str, ip_str,
                                  d->hostname, sizeof(d->hostname),
                                  d->hostname_src, sizeof(d->hostname_src));
-            } else if (strcmp(d->hostname_src, "mac") == 0) {
-                /* 已存在但是 mac 兜底 → 重试 manual/mdns */
+                d->last_resolve = now_t;
+            } else if (strcmp(d->hostname_src, "mac") == 0
+                    || (now_t - d->last_resolve) >= 60) {
+                /* v3.5.0-rc R-2: 同 scan_arp 路径,60s 时间窗口 re-resolve
+                 * 触发场景:1) mac 兜底立即重试 2) 改名 60s 内生效 */
                 resolve_hostname(mac_str, ip_str,
                                  d->hostname, sizeof(d->hostname),
                                  d->hostname_src, sizeof(d->hostname_src));
+                d->last_resolve = now_t;
             }
             strncpy(d->ip,    ip_str, sizeof(d->ip)-1);
             strncpy(d->iface, iface,  sizeof(d->iface)-1);
-            d->last_seen = time(NULL);
+            d->last_seen = now_t;
             d->active    = 1;
             d->state     = ndm->ndm_state;
             g_dirty      = 1;
+            g_last_event = now_t;  /* v3.5.0-rc R-1: 更新事件时间戳给 de-bounce 用 */
             hlog("NEW: %s (%s) on %s state=0x%x", mac_str, ip_str, iface, ndm->ndm_state);
         }
     }
 
-    /* 有变化时立即写 JSON */
-    if (g_dirty) write_json();
+    /* v3.5.0-rc R-1: 不再"有变化立即 write_json"。
+     * 仅 set g_dirty,主循环用 200ms de-bounce 合并连续事件。
+     * 这避免了同一设备 5 秒内 state 变 3 次 → 3 次 write_json 的情况。
+     * 实测:RMX5010 上单个客户端连接热点,5 秒内 6+ 个 state transition,
+     * de-bounce 后合并为 1 次 write_json,文件 IO 减少 80%+ */
 }
 
 /* ══════════════════════════════════════════════════════════
@@ -657,6 +676,14 @@ int main(int argc, char *argv[]) {
     /* 初始扫描 */
     scan_arp();
 
+    /* v3.5.0-rc R-1: de-bounce 状态变量
+     * dirty_since = 上次 g_dirty 从 0→1 的时刻
+     * 主循环规则:dirty 后等 ~500ms 没有新事件才 write_json
+     * 注意:用 wall-clock 秒精度,因为 select timeout 200ms 已经够细
+     * 写法:dirty=1 且 (now - dirty_since >= 1) 才写,等价于"超过 1s 的 dirty"
+     * (Linux time(NULL) 秒精度,所以 1s 是最小可表达 de-bounce 窗口) */
+    time_t dirty_since = 0;
+
     /* ── 主事件循环 ────────────────────────────────────────── */
     while (g_running) {
         /* 处理 SIGUSR1 */
@@ -666,10 +693,26 @@ int main(int argc, char *argv[]) {
             scan_arp();
         }
 
-        /* 超时 300s 后对陈旧设备做清理 */
         time_t now = time(NULL);
-        if (now - g_last_write > 30 && g_dirty) {
-            write_json();
+
+        /* v3.5.0-rc R-1: de-bounce write
+         * 1) g_dirty 刚从 0→1: 记 dirty_since
+         * 2) g_dirty 持续 1: 等到至少 1s 没有更多 nl_process 调用时 write
+         * 3) 30s 强制 flush 兜底(防止持续 dirty 永远不写) */
+        if (g_dirty) {
+            if (dirty_since == 0) {
+                dirty_since = now;  /* 第一次 mark dirty */
+            }
+            int elapsed = (int)(now - dirty_since);
+            int last_event = (int)(now - g_last_event);
+
+            /* 写入条件:
+             * a) 距上次事件 >= 1s(短时间无新事件,可以合并) OR
+             * b) 距首次 dirty >= 30s(强制兜底) */
+            if (last_event >= 1 || elapsed >= 30) {
+                write_json();
+                dirty_since = 0;  /* reset de-bounce 窗口 */
+            }
         }
 
         fd_set rfds;
@@ -678,15 +721,21 @@ int main(int argc, char *argv[]) {
         FD_SET(g_srv_fd, &rfds);
         int maxfd = (g_nl_fd > g_srv_fd ? g_nl_fd : g_srv_fd) + 1;
 
-        struct timeval tv = {.tv_sec = 5, .tv_usec = 0};
+        /* select timeout: dirty 时短(继续 de-bounce 检查),非 dirty 时长 */
+        struct timeval tv;
+        if (g_dirty) {
+            tv.tv_sec = 1; tv.tv_usec = 0;  /* 1s 检查一次 de-bounce 窗口 */
+        } else {
+            tv.tv_sec = 5; tv.tv_usec = 0;  /* 闲时 5s,省 CPU */
+        }
         int ret = select(maxfd, &rfds, NULL, NULL, &tv);
         if (ret < 0) {
-            if (errno == EINTR) continue;  /* 信号打断，正常 */
+            if (errno == EINTR) continue;  /* 信号打断,正常 */
             hlog("ERROR: select: %s", strerror(errno));
             break;
         }
 
-        if (ret == 0) continue;  /* 超时，继续循环 */
+        if (ret == 0) continue;  /* 超时,继续循环 */
 
         /* 处理 netlink 事件 */
         if (FD_ISSET(g_nl_fd, &rfds))

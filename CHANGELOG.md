@@ -2,6 +2,226 @@
 
 ---
 
+## v3.5.0-rc · 2026-04-12
+
+> **🎯 v3.5.0-rc = 收尾 + polish + 工程化文档完善**。这是 v3.5 的最后一个 pre-release,beta1 在真机上发现的两个 bug 修了,加了 ROADMAP / README,准备进入 v3.5.0 final。
+
+### 🎯 本版主题
+
+| 任务 | 状态 |
+|---|---|
+| **R-1** hotspotd nl_process 1s de-bounce(合并连续 netlink 事件) | ✅ |
+| **R-2** Device.last_resolve + 60s 时间窗口 re-resolve(修改名 bug) | ✅ |
+| **R-3** 删除 device_detect.sh "v3.4.11 hotspotd 不要启用" 过时警告 | ✅ |
+| **R-4** smoke test 期望更新(hotspotd 应该在跑 + 验证 -d 参数 + P0-4 字段) | ✅ |
+| **R-5** README.md 完整更新到 v3.5(原 v3.4.10 LTS 时代版本) | ✅ |
+| **R-6** ROADMAP.md(v3.5 剩余 + v3.6 候选) | ✅ |
+| **R-2 测试** 6 个新 C 单元测试(test_hostname_helpers 16 → 22) | ✅ |
+| **CHANGELOG** beta1 → rc 段落 | ✅ |
+
+### 🔧 真机发现的 2 个 bug,代码已修
+
+beta1 在真机上稳定运行,但暴露了 2 个之前没看到的问题。两个都已经修了。
+
+#### R-1: hotspotd nl_process 写入风暴
+
+**bug 现象**(beta1 真机日志,RMX5010 / Android 16):
+```
+20:23:24 NEW e2:0d:4a:48:5d:40 state=0x4   → JSON written
+20:23:29 NEW e2:0d:4a:48:5d:40 state=0x10  → JSON written
+20:23:29 NEW e2:0d:4a:48:5d:40 state=0x2   → JSON written  ← 同一秒第二次!
+20:23:49 NEW e2:0d:4a:48:5d:40 state=0x4   → JSON written
+```
+
+**根因**:netlink 通常会对单个设备产生多个 state transition(REACHABLE → DELAY → STALE → PROBE → REACHABLE)。hotspotd 之前的实现是"每次 nl_process 内立即 write_json",结果同一台设备 5 秒内能触发 6+ 次文件写。
+
+**影响**:不是功能 bug 但是性能/IO bug。WebUI 每次拿到不同的 snapshot;闪存写入次数增加(对现代 UFS 寿命影响可忽略,但代码上不优雅)。
+
+**修复**:
+```c
+// 旧:nl_process 内
+g_dirty = 1;
+hlog("NEW: ...");
+// 立即调 write_json()  ← 删掉这个
+
+// 新:nl_process 内
+g_dirty = 1;
+g_last_event = time(NULL);  // 记事件时间戳
+hlog("NEW: ...");
+// 不写,让主循环判断
+
+// 主循环
+if (g_dirty) {
+    if (dirty_since == 0) dirty_since = now;
+    if ((now - g_last_event) >= 1 || (now - dirty_since) >= 30) {
+        write_json();
+        dirty_since = 0;
+    }
+}
+```
+
+**de-bounce 策略**:
+- nl_process 不立即写,只设 dirty 和事件时间戳
+- 主循环每次 wakeup 检查:**距上次事件 >= 1 秒**(无新事件可以合并)**OR 距首次 dirty >= 30 秒**(强制 flush 兜底)
+- select timeout dirty 时 1s,空闲 5s
+- scan_arp 是 SIGUSR1 触发,**保持立即 write**(用户主动操作不需要 de-bounce)
+
+**预期效果**:RMX5010 真机日志里那种"5 秒内同设备 6 次 write"的情况会合并为 1 次 write,**写入 IO 减少 80%+**。同时 WebUI 看到的设备列表更稳定(不会闪烁)。
+
+**注意**:这个修复让 devices.json 写入有最多 1 秒延迟(de-bounce 窗口)。对 user 体验影响为零(WebUI 本来就是 polling 模式,不是 push)。
+
+---
+
+#### R-2: 改名场景下 hostname 不更新
+
+**bug 现象**(真机测试):
+```sh
+# 第一次命名
+sh /data/local/hnc/bin/json_set.sh name_set e2:0d:4a:48:5d:40 "测试设备"
+kill -USR1 $HOTSPOTD_PID
+cat devices.json
+# 输出: {"hostname":"测试设备","hostname_src":"manual"} ✅
+
+# 改名
+sh /data/local/hnc/bin/json_set.sh name_set e2:0d:4a:48:5d:40 "客厅手机"
+cat device_names.json
+# 输出: {"e2:0d:4a:48:5d:40":"客厅手机"} ✅ 改了
+
+kill -USR1 $HOTSPOTD_PID
+sleep 2
+cat devices.json
+# 输出: {"hostname":"测试设备","hostname_src":"manual"} ❌ 还是旧名!
+```
+
+**根因**:hotspotd.c 里 re-resolve 触发条件:
+```c
+} else if (strcmp(d->hostname_src, "mac") == 0) {
+    resolve_hostname(...);  // 重读 device_names.json
+}
+```
+
+**只在 hostname_src == "mac" 时重试**。第一次命名后 hostname_src 变 "manual",条件永远不再为真,改名不会触发重读。
+
+**修复**(R-2):
+
+1. `Device` struct 加 `time_t last_resolve` 字段
+2. re-resolve 条件改为:
+   ```c
+   if (strcmp(d->hostname_src, "mac") == 0 || (now - d->last_resolve) >= 60) {
+       resolve_hostname(...);
+       d->last_resolve = now;
+   }
+   ```
+3. scan_arp 和 nl_process 两个路径都改
+
+**60s 时间窗口的取舍**:
+- 改名后 user 期望"立即"生效,但 hotspotd 是事件驱动,只有下次 ARP scan / netlink 事件才触发 re-resolve
+- 60s 是平衡点:足够频繁让 user 觉得"很快生效",又足够稀疏不会每次 ARP 扫描都跑 popen mDNS(性能)
+- 实际场景:user 改名后,下次客户端有任何活动(发包 / 心跳)就会触发 netlink → re-resolve → 新名生效。一般 < 10s
+
+**6 个新 C 单元测试**(test_hostname_helpers.c):
+```
+── re-resolve 触发条件 (v3.5.0-rc R-2) ──
+  ✓ mac fallback always re-resolves
+  ✓ manual within 60s window: no re-resolve
+  ✓ manual after 60s window: re-resolve
+  ✓ manual after 5min: re-resolve
+  ✓ mdns at 59s: no re-resolve
+  ✓ mdns at exactly 60s: re-resolve (>= boundary)
+```
+
+**总测试数**:64 shell + **22** C hostname + 11 C mdns = **97 个全过**(从 91 增加 6 个)
+
+---
+
+### 📚 文档完善
+
+#### R-5 README.md 完整重写
+
+之前的 README 是 v3.4.10 LTS 时代的,主要讲 LTS 维护期。**v3.5 的 README 现在反映**:
+
+- v3.5 是工程化主题版本(测试 / CI / hotspotd 生产可用)
+- v3.5 vs v3.4.10 LTS 选择指引
+- 完整的开发流程(跑测试 / 装机自检 / 本地编译 / 提 issue)
+- 故障排查的常见问题(包括 hotspotd 写入风暴和改名 bug 的修复说明)
+- 老 LTS 章节降级为"长期支持"段落
+
+#### R-6 ROADMAP.md(全新)
+
+第一个版本的 ROADMAP,内容:
+
+- **当前状态**:所有版本的 release/进行中/计划状态
+- **v3.5.0-rc 任务清单**:已完成 + 待办(你做的部分)
+- **v3.5.0 final 任务**:正式 release 流程
+- **v3.6 候选主题**:nftables 后端、流量历史图表、设备上线通知、流量配额、多 root 框架、主题市场、WebUI i18n 等。**所有都是占位想法,没有具体规划**,等 v3.5 final release 后再立项
+- **不做的事**:VPN / 代理 / 广告拦截 / 防火墙 GUI / DNS 配置 — 明确的 scope 边界
+
+---
+
+### 🔧 R-3: device_detect.sh 警告更新
+
+之前在 LTS 期写了 30 行 "v3.4.11 hotspotd 不要启用,有 4 个 P0/P1 bug" 的警告。**那些 bug 在 beta1 全修了**,警告现在是误导。
+
+**改成 "v3.5.0+ hotspotd C daemon 已启用,生产可用"** 的状态说明,列出修过的 bug 和真机验证的环境。
+
+---
+
+### 🧪 R-4: smoke test 改进
+
+**新检查**:
+- ✅ hotspotd 应该**在跑**(之前的 smoke test 期望它**不在跑**,基于 LTS 期的认知,beta1 真机情况翻转了)
+- ✅ 验证进程 comm 真的是 "hotspotd"(不是别的进程占了 PID 文件)
+- ✅ 验证启动参数含 `-d`(P1-2 修复)
+- ✅ 新增 [4b] section:验证 devices.json 含 hostname_src 字段(P0-4 修复证据)
+- ✅ devices.json 形式合法性检查 + 前 200 字节内容显示
+
+**这让 smoke test 变成了 v3.5 修复的真机验证工具**。装上 zip → 跑 smoke test → 看每个 ✓ → 知道哪些修复在自己设备上生效。
+
+---
+
+### 📦 修改文件汇总
+
+| 文件 | 改动 |
+|---|---|
+| `module.prop` | v3.5.0-beta1 → **v3.5.0-rc** / versionCode 3501 → 3502 |
+| `webroot/index.html` | about-ver |
+| `bin/diag.sh` | 版本号 |
+| `daemon/hotspotd.c` | R-1 de-bounce + R-2 last_resolve + 60s 窗口(~50 行新代码) |
+| `daemon/test/test_hostname_helpers.c` | 6 个 R-2 测试用例 |
+| `bin/device_detect.sh` | R-3 警告替换为状态说明 |
+| `hnc_smoke_test.sh` | R-4 期望翻转 + [4b] devices.json 验证 |
+| **`README.md`** | **完整重写,反映 v3.5** |
+| **`ROADMAP.md`** | **新建,v3.5 剩余 + v3.6 候选** |
+| `CHANGELOG.md` | 本段落 |
+
+### 🚦 升级注意
+
+- **完全无 break 改动**,从 v3.5.0-beta1 直接覆盖即可
+- **R-1 de-bounce 让 devices.json 写入有最多 1 秒延迟**,WebUI 体验无感知(本来就是 polling)
+- **R-2 60s 时间窗口**:改名后最多 60s 生效,实际通常 < 10s(下次客户端有任何活动就触发 netlink → re-resolve)
+- **测试数量**:beta1 是 91 个,rc 是 **97 个**(加了 6 个 R-2 测试)
+- **真机验证**:你需要装 v3.5.0-rc CI artifact 后跑 smoke test,验证 R-1 R-2 修复在真机上生效
+
+### 🎯 v3.5.0-rc → final 还剩什么
+
+| 任务 | 你做 / 我做 |
+|---|---|
+| **R-10** 装 rc CI artifact + smoke test 验证 | 你 |
+| **R-11** 24 小时长跑稳定性测试 | 你的真机时间 |
+| **F-1** 修长跑发现的 bug(预期 0-3 个) | 我 |
+| **F-2** GitHub Release Notes | 我 |
+| **F-3** 打 tag `v3.5.0` 触发 CI release | 你(命令行 1 行) |
+| **F-4** 庆祝 🎉 | 大家 |
+
+### 💭 v3.5.0-rc 的真实价值
+
+**v3.5.0-beta1 把 hotspotd 修好了 + CI 跑通了 + 真机稳定运行**。
+**v3.5.0-rc 收拾真机暴露的两个性能 bug + 完善文档,让 v3.5 可以 release**。
+
+beta1 是"工程化奠基"的高潮,rc 是"工程化收尾"的清理。没有戏剧性新功能,但**让 v3.5 真正达到 release 级别的成熟度**。
+
+---
+
 ## v3.5.0-beta1 · 2026-04-12
 
 > **🔧 v3.5.0-beta1 = hotspotd 修复 + GitHub CI + benchmark**。alpha 完成了"测试框架"主题,beta1 完成了"hotspotd 工程化"主题。但 hotspotd **仍然没有默认启用** — 启用留给 beta2,beta1 是为启用做准备的全部基础设施工作。

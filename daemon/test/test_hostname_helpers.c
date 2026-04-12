@@ -204,6 +204,71 @@ static void test_mac_fallback_no_colon(void) {
     ASSERT_EQ("ccddeeff", out, "MAC without colons");
 }
 
+/* === v3.5.0-rc R-2: re-resolve 触发条件测试 ===
+ *
+ * 这里复刻 hotspotd.c scan_arp/nl_process 的判断逻辑:
+ *
+ *   should_re_resolve(d, now) =
+ *     d->hostname_src == "mac" || (now - d->last_resolve) >= 60
+ *
+ * 三个核心场景:
+ *   1) mac 兜底 → 立即重试(不管 last_resolve 多新)
+ *   2) manual/mdns 但 < 60s → 不重试
+ *   3) manual/mdns 且 >= 60s → 重试(支持改名场景)
+ */
+
+/* 模拟 Device 的最小子集 */
+typedef struct {
+    char hostname_src[HN_SRC_LEN];
+    long last_resolve;  /* 用 long 替代 time_t,沙箱测试不需要真实时间 */
+} TestDevice;
+
+static int should_re_resolve(const TestDevice *d, long now) {
+    if (strcmp(d->hostname_src, "mac") == 0) return 1;
+    if ((now - d->last_resolve) >= 60) return 1;
+    return 0;
+}
+
+static void test_re_resolve_mac_fallback_immediate(void) {
+    TestDevice d = {.hostname_src = "mac", .last_resolve = 1000};
+    /* mac 兜底,now 仅过 5 秒,应该重试 */
+    int rc = should_re_resolve(&d, 1005);
+    ASSERT_INT_EQ(1, rc, "mac fallback always re-resolves");
+}
+
+static void test_re_resolve_manual_within_window(void) {
+    TestDevice d = {.hostname_src = "manual", .last_resolve = 1000};
+    /* manual 且 only 30 秒过去,不应该重试 */
+    int rc = should_re_resolve(&d, 1030);
+    ASSERT_INT_EQ(0, rc, "manual within 60s window: no re-resolve");
+}
+
+static void test_re_resolve_manual_after_window(void) {
+    TestDevice d = {.hostname_src = "manual", .last_resolve = 1000};
+    /* manual 但 60 秒过去,应该重试(支持改名) */
+    int rc = should_re_resolve(&d, 1060);
+    ASSERT_INT_EQ(1, rc, "manual after 60s window: re-resolve");
+}
+
+static void test_re_resolve_manual_long_after(void) {
+    TestDevice d = {.hostname_src = "manual", .last_resolve = 1000};
+    /* manual 但 5 分钟过去,肯定要重试 */
+    int rc = should_re_resolve(&d, 1300);
+    ASSERT_INT_EQ(1, rc, "manual after 5min: re-resolve");
+}
+
+static void test_re_resolve_mdns_within_window(void) {
+    TestDevice d = {.hostname_src = "mdns", .last_resolve = 1000};
+    int rc = should_re_resolve(&d, 1059);  /* 59 秒,边界 */
+    ASSERT_INT_EQ(0, rc, "mdns at 59s: no re-resolve");
+}
+
+static void test_re_resolve_mdns_at_exactly_60(void) {
+    TestDevice d = {.hostname_src = "mdns", .last_resolve = 1000};
+    int rc = should_re_resolve(&d, 1060);  /* 正好 60 秒,应该 >= 触发 */
+    ASSERT_INT_EQ(1, rc, "mdns at exactly 60s: re-resolve (>= boundary)");
+}
+
 /* === main === */
 
 int main(void) {
@@ -228,6 +293,14 @@ int main(void) {
     test_mac_fallback_standard();
     test_mac_fallback_short();
     test_mac_fallback_no_colon();
+
+    printf("\n── re-resolve 触发条件 (v3.5.0-rc R-2) ──\n");
+    test_re_resolve_mac_fallback_immediate();
+    test_re_resolve_manual_within_window();
+    test_re_resolve_manual_after_window();
+    test_re_resolve_manual_long_after();
+    test_re_resolve_mdns_within_window();
+    test_re_resolve_mdns_at_exactly_60();
 
     /* 清理 */
     unlink(DEVICE_NAMES_JSON);

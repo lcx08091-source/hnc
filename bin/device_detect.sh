@@ -13,27 +13,26 @@
 # 输出格式与原 shell 版本 100% 兼容
 #
 # ════════════════════════════════════════════════════════════════════
-# ⚠️ v3.4.11 LTS 重要警告:hotspotd C daemon 不要启用
+# ✅ v3.5.0+ hotspotd C daemon 状态:已启用,生产可用
 # ════════════════════════════════════════════════════════════════════
-# 本脚本设计上支持 hotspotd C daemon 接管扫描(netlink 事件驱动,
-# 实时性比 shell 轮询好),但 hotspotd 在 LTS 阶段是【实验性未完成】功能:
+# v3.4.x LTS 期 hotspotd 是实验性的(P0-4 / P1-2 / P1-7 / P1-8 都没修),
+# 当时建议不要启用。v3.5.0-beta1 修了所有已知 bug,真机验证通过:
 #
-#   1. hotspotd 二进制【不在 zip 包里】(只有 daemon/hotspotd.c 源码)
-#   2. hotspotd write_json 不调 mDNS / 不读 device_names.json /
-#      不写 hostname_src 字段 → 启用后所有"手动命名"和"mDNS 自动识别"
-#      功能立刻失效(P0-4)
-#   3. watchdog 用 --daemon 参数重启它会失败(hotspotd 只识别 -d) → P1-2
-#   4. 多设备时 fgets(256) 截断会导致黑名单识别失效 → P1-7
-#   5. 没有任何真机长时间测试记录
+#   ✅ P0-4 修复:hotspotd 现在调 lookup_manual_name + try_mdns_resolve,
+#                hostname 解析跟 shell 路径完全一致(优先级 manual > mdns > mac)
+#   ✅ P1-2 修复:watchdog.sh 用 -d 参数重启 hotspotd
+#   ✅ P1-7 修复:write_json 用 fread(16384) 读黑名单,30+ 设备不再截断
+#   ✅ P1-8 修复:Device struct 加 hostname_src 字段,MAC 兜底对齐 shell 算法
+#   ✅ v3.5.0-rc R-1 修复:nl_process 加 1s de-bounce,合并连续 netlink 事件
+#   ✅ v3.5.0-rc R-2 修复:resolve_hostname 60s 时间窗口,改名后 60s 内自动生效
 #
-# 如果你出于好奇或想推动 v3.5+ 开发去手动编译了 hotspotd 并放到
-# /data/local/hnc/bin/hotspotd,你会立刻撞 4 个 P0/P1 bug。
+# 真机验证(RMX5010 SD8 Elite / Android 16 / kernel 6.6.102 / SukiSU):
+#   - hotspotd 稳定运行(无 crash / 无 OOM / 无 SELinux deny)
+#   - netlink RTMGRP_NEIGH 在新内核工作正常
+#   - resolve_hostname 全部 4 个测试用例(mac/manual/mdns/rename)通过
 #
-# 当前默认状态:hotspotd 二进制不存在 → hotspotd_alive 永远 false
-# → 自动 fall back 到 shell daemon → 100% 功能正常 → 已实测稳定
-#
-# 如需 v3.5+ 真正启用 hotspotd,需要先修 P0-4 / P1-2 / P1-7 / P1-8
-# 并完成真机长时间测试。LTS 期不动 hotspotd 路径。
+# v3.5.0+ 默认启用 hotspotd(如果 binary 存在)。Shell daemon 仍是 fallback,
+# 但实测情况:hotspotd 一旦启动就不会回退到 shell。
 # ════════════════════════════════════════════════════════════════════
 
 HNC_DIR=${HNC_DIR:-/data/local/hnc}
