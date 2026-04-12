@@ -1430,10 +1430,46 @@ html,body { min-height:100%; background:var(--bg); color:var(--t0); font-family:
         <div class="about-name">HNC · Hotspot Network Control</div>
         <div class="about-author">作者：Claude (Anthropic AI) &nbsp;·&nbsp; KSU / Magisk 模块</div>
       </div>
-      <span class="about-ver">v3.5.1</span>
+      <span class="about-ver">v3.5.2</span>
     </div>
     <!-- 更新日志 -->
     <div class="changelog">
+
+      <!-- v3.5.2 架构修复版（默认展开）-->
+      <div class="cl-item">
+        <div class="cl-left">
+          <div class="cl-dot"></div>
+          <div class="cl-line"></div>
+        </div>
+        <div class="cl-right">
+          <div class="cl-title">🏗️ v3.5.2 架构修复版 &nbsp;<span style="font-size:11px;color:var(--t2);font-weight:400">2026-04-13</span></div>
+          <div class="cl-tags">
+            <span class="cl-tag feat" style="background:#dc2626;color:#fff">v3.5.2 架构修复</span>
+            <span class="cl-tag feat">第二轮 AI 审查</span>
+            <span class="cl-tag feat">2 P0 + 5 P1 + 4 P2</span>
+            <span class="cl-tag feat">112 测试</span>
+          </div>
+          <ul class="cl-changes">
+            <li><b>🏗️ v3.5.2 = 第二轮 AI 审查发现 2 个 P0 + 5 个 P1 + 4 个 P2</b>。v3.5.1 修了显性 bug 但没看到 daemon 生命周期架构问题。<b>v3.5.1 不应作为 release</b>,直接被 v3.5.2 替代</li>
+            <li><b>🔴 P0-A watchdog 双重复活架构 race(catastrophic)</b>:<code>service.sh:147</code> 的 <code>echo $HPID > detect.pid</code> 让 detect.pid 和 hotspotd.pid 存同一 PID。hotspotd 崩溃后 watchdog 两个独立 if 都触发重启 → C daemon A 和 shell fallback F 同时运行 → 并发写 <code>devices.json.tmp</code> 互相截断 → JSON 损坏 + pid 文件被 cleanup 误删 → watchdog 永远失明。修复:service.sh 不再 <code>echo $HPID > detect.pid</code> + watchdog 改优先级架构(hotspotd 活着直接 return,不检查 detect.pid) + daemon spawn 锁(mkdir $RUN/daemon.spawn)+ DEVICES_TMP 带 PID 后缀(<code>devices.json.tmp.&lt;pid&gt;</code>)</li>
+            <li><b>🔴 P0-B REFRESH IPC 阻塞 DoS</b>:handle_client 收到 REFRESH 命令同步调 scan_arp,对 N 个新设备串行 popen <code>mdns_resolve -t 800</code> → 最坏 N × 800ms 阻塞主线程 → netlink 缓冲溢出丢包 → 设备永久丢失。<b>恶意本机进程连 socket 发 REFRESH 即可 DoS hotspotd</b>。修复(一半):REFRESH 只设 <code>g_need_scan = 1</code> 返回 <code>OK:queued</code>,不再同步阻塞。<b>剩下的一半(scan_arp 内部 popen mdns 阻塞)留 v3.6 做 work queue</b></li>
+            <li><b>🟡 P1-A 测试作弊:R-2 测试是影子函数</b>:v3.5.0-rc 写的 6 个 R-2 测试定义了一个 <code>should_re_resolve(TestDevice *, long)</code>,<b>hotspotd.c 里根本没有这个函数</b>。主代码是 scan_arp 和 nl_process 里两处内联 if。审查员指出这是假的 coverage 标签。修复:提取 <code>should_re_resolve(const char *, time_t, time_t)</code> 成真函数,两处调用它;测试用相同签名(仍然复制,但真签名+真实现,drift 会让编译报错)。<b>我对这个 guilty</b>——v3.5.0-rc 写测试时知道这是平行宇宙函数但没澄清,这次修复包括自己承认这点</li>
+            <li><b>🟡 P1-B handle_client 无 socket 超时</b>:recv/send 都无 SO_RCVTIMEO/SNDTIMEO。恶意本机进程连 socket 不发数据 → recv 无限阻塞 → 单线程 daemon DoS。修复:RCVTIMEO=2s, SNDTIMEO=5s,GET_DEVICES 的 send 循环检查返回值</li>
+            <li><b>🟡 P1-C netlink ENOBUFS 无恢复</b>:默认 SO_RCVBUF ~128KB,30+ 客户端事件风暴容易溢出。溢出时 kernel 丢包,recv 返回 -1/ENOBUFS,v3.5.1 代码吞掉 → 设备表永久不一致。修复:SO_RCVBUF 调到 1MB + ENOBUFS 触发 <code>g_need_scan = 1</code> 全量重扫</li>
+            <li><b>🟡 P1-D write_pid 无 O_EXCL + cleanup 无条件 unlink</b>:任何并发实例都能覆盖 PID 文件,第二个实例 FATAL 走 cleanup 会无条件 unlink PID_FILE,第一个实例的 PID 文件消失。修复:write_pid 用 <code>open(O_CREAT|O_EXCL|O_WRONLY)</code>,如果文件存在则读旧 PID 用 <code>kill -0</code> 检查,活着就干净 exit(不走 cleanup 避免误删);cleanup_pid 验证文件里是不是自己的 PID 才 unlink</li>
+            <li><b>🟡 P1-E update_traffic_stats 同步 popen iptables</b>:每次 write_json 开头 popen <code>iptables_manager.sh stats_all</code> → fork+exec shell+iptables+awk。iptables 成本 O(链规则数),长期运行后几百毫秒。write_json 最短 1 秒一次 → 主线程停摆。修复:5 秒 TTL 缓存,流量数字轻微延迟但主线程不停</li>
+            <li><b>🟢 P2-A write_pid 失败日志</b>:之前静默,权限错误时 watchdog 永远重启不了</li>
+            <li><b>🟢 P2-D scan_arp fgets 返回值检查</b>:消除 -Wunused-result 警告</li>
+            <li><b>🟢 P2-E g_log FD_CLOEXEC</b>:之前 popen 子进程继承日志 fd,hardening 问题</li>
+            <li><b>🟢 P2-F json_escape UTF-8 边界回退</b>:buffer 不够时原来直接 break,可能在 UTF-8 多字节序列中间截断(中文 3 字节)。JSON 合法但 WebUI JSON.parse 后显示乱码。修复:回退到 last non-continuation byte,检查它是 ASCII 还是 lead byte,lead byte 需要的 continuation 数(1/2/3)跟实际有的数对比,不完整就删掉整个残缺字符。<b>实现中发现原来的 rollback 循环 "last lead byte 就 j--" 会把完整字符也删掉</b>,这是隐藏的真 bug</li>
+            <li><b>🧪 测试 106 → 112</b>:+4 个 P2-F UTF-8 边界测试(mid/tight/no-trunc/cant-fit-lead)+ 6 个 R-2 测试改真签名(从 shadow 替换,不是新增)</li>
+            <li><b>🚫 v3.5.2 暂不修(v3.6)</b>:P0-B 核心(scan_arp 内部 popen mdns 异步化,需要 work queue)+ P1-F 测试 #include 重构(从 hotspotd.c 提取 helpers 到 hnc_helpers.c/.h)+ P2-B 8KB 硬上限 + P2-C fork-isolated test runner + P2-G mdns 输出白名单 + P2-H fuzz/integration 测试</li>
+            <li><b>📦 修改文件</b>:module.prop(v3.5.2/3505)+ service.sh(P0-A 层 1)+ watchdog.sh(P0-A 层 2 优先级架构)+ device_detect.sh(P0-A 层 3 spawn 锁)+ hotspotd.c(10 处修复)+ test_hostname_helpers.c(+4 测试)+ webroot(本段)+ diag.sh + CHANGELOG + smoke test</li>
+            <li><b>🚦 升级注意</b>:直接覆盖 v3.5.0/v3.5.1,数据全部保留。<b>PID 文件语义变了</b>:C daemon 模式下 detect.pid 不存在,只有 hotspotd.pid。验证方法:<code>ls /data/local/hnc/run/*.pid</code> 应该只看到 hotspotd.pid + watchdog.pid,<b>没有</b> detect.pid</li>
+            <li><b>💭 v3.5 三层修复</b>:v3.5.0 建好工程基础设施(CI + 测试框架 + C daemon),v3.5.1 修好显性功能正确性(注入/转义/PID race),v3.5.2 修好 daemon 生命周期架构(watchdog 双重复活/IPC 阻塞/socket 超时)。<b>三个版本各修一层,缺一不可</b>。v3.5.2 是 v3.5 系列第一个真正可以作为 GitHub Release 的版本</li>
+          </ul>
+        </div>
+      </div>
 
       <!-- v3.5.1 紧急修复版（默认展开）-->
       <div class="cl-item">

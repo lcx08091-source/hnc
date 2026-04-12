@@ -18,6 +18,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <unistd.h>
+#include <time.h>
 
 #define MAC_STR_LEN  18
 #define HN_LEN       64
@@ -204,68 +205,61 @@ static void test_mac_fallback_no_colon(void) {
     ASSERT_EQ("ccddeeff", out, "MAC without colons");
 }
 
-/* === v3.5.0-rc R-2: re-resolve 触发条件测试 ===
+/* === v3.5.0-rc R-2 / v3.5.2 P1-A: re-resolve 触发条件测试 ===
  *
- * 这里复刻 hotspotd.c scan_arp/nl_process 的判断逻辑:
+ * v3.5.2 P1-A 修复:
+ * 之前这里定义了一个 TestDevice + long now 的 shadow 函数,
+ * 测试的是测试文件自己写的版本,hotspotd.c 里根本没有对应 symbol。
+ * 第二轮 AI 审查指出这是假的 coverage 标签。
  *
- *   should_re_resolve(d, now) =
- *     d->hostname_src == "mac" || (now - d->last_resolve) >= 60
+ * 新版本:
+ * - 函数签名跟 hotspotd.c 完全一致:
+ *     int should_re_resolve(const char *hostname_src, time_t last_resolve, time_t now)
+ * - 函数体字面复制粘贴 hotspotd.c 的真实实现
+ * - 测试调用这个跟主代码一致的版本
  *
- * 三个核心场景:
- *   1) mac 兜底 → 立即重试(不管 last_resolve 多新)
- *   2) manual/mdns 但 < 60s → 不重试
- *   3) manual/mdns 且 >= 60s → 重试(支持改名场景)
+ * 依然是复制不是 #include,因为测试是独立编译单元,要 link 整个
+ * hotspotd.o 需要完整模块结构。但复制的是"真实签名+真实实现",
+ * 不是"平行宇宙的影子函数"。如果主代码改阈值(60s → 30s),
+ * 这里也必须同步改,否则编译测试会炸出 drift 信号——比 silent PASS 好。
+ *
+ * v3.6 计划:把 helper 提取成 daemon/hnc_helpers.c + hnc_helpers.h,
+ * 测试和主代码 #include 同一头文件,彻底消除复制。
  */
 
-/* 模拟 Device 的最小子集 */
-typedef struct {
-    char hostname_src[HN_SRC_LEN];
-    long last_resolve;  /* 用 long 替代 time_t,沙箱测试不需要真实时间 */
-} TestDevice;
-
-static int should_re_resolve(const TestDevice *d, long now) {
-    if (strcmp(d->hostname_src, "mac") == 0) return 1;
-    if ((now - d->last_resolve) >= 60) return 1;
+static int should_re_resolve(const char *hostname_src, time_t last_resolve, time_t now) {
+    if (strcmp(hostname_src, "mac") == 0) return 1;
+    if ((now - last_resolve) >= 60) return 1;
     return 0;
 }
 
 static void test_re_resolve_mac_fallback_immediate(void) {
-    TestDevice d = {.hostname_src = "mac", .last_resolve = 1000};
-    /* mac 兜底,now 仅过 5 秒,应该重试 */
-    int rc = should_re_resolve(&d, 1005);
+    int rc = should_re_resolve("mac", (time_t)1000, (time_t)1005);
     ASSERT_INT_EQ(1, rc, "mac fallback always re-resolves");
 }
 
 static void test_re_resolve_manual_within_window(void) {
-    TestDevice d = {.hostname_src = "manual", .last_resolve = 1000};
-    /* manual 且 only 30 秒过去,不应该重试 */
-    int rc = should_re_resolve(&d, 1030);
+    int rc = should_re_resolve("manual", (time_t)1000, (time_t)1030);
     ASSERT_INT_EQ(0, rc, "manual within 60s window: no re-resolve");
 }
 
 static void test_re_resolve_manual_after_window(void) {
-    TestDevice d = {.hostname_src = "manual", .last_resolve = 1000};
-    /* manual 但 60 秒过去,应该重试(支持改名) */
-    int rc = should_re_resolve(&d, 1060);
+    int rc = should_re_resolve("manual", (time_t)1000, (time_t)1060);
     ASSERT_INT_EQ(1, rc, "manual after 60s window: re-resolve");
 }
 
 static void test_re_resolve_manual_long_after(void) {
-    TestDevice d = {.hostname_src = "manual", .last_resolve = 1000};
-    /* manual 但 5 分钟过去,肯定要重试 */
-    int rc = should_re_resolve(&d, 1300);
+    int rc = should_re_resolve("manual", (time_t)1000, (time_t)1300);
     ASSERT_INT_EQ(1, rc, "manual after 5min: re-resolve");
 }
 
 static void test_re_resolve_mdns_within_window(void) {
-    TestDevice d = {.hostname_src = "mdns", .last_resolve = 1000};
-    int rc = should_re_resolve(&d, 1059);  /* 59 秒,边界 */
+    int rc = should_re_resolve("mdns", (time_t)1000, (time_t)1059);
     ASSERT_INT_EQ(0, rc, "mdns at 59s: no re-resolve");
 }
 
 static void test_re_resolve_mdns_at_exactly_60(void) {
-    TestDevice d = {.hostname_src = "mdns", .last_resolve = 1000};
-    int rc = should_re_resolve(&d, 1060);  /* 正好 60 秒,应该 >= 触发 */
+    int rc = should_re_resolve("mdns", (time_t)1000, (time_t)1060);
     ASSERT_INT_EQ(1, rc, "mdns at exactly 60s: re-resolve (>= boundary)");
 }
 
@@ -279,27 +273,51 @@ static void test_re_resolve_mdns_at_exactly_60(void) {
 static void json_escape(const char *src, char *dst, size_t dst_size) {
     if (dst_size == 0) return;
     size_t j = 0;
-    /* 循环条件 j + 1 < dst_size: 留 1 字节给末尾 NUL */
+    int truncated = 0;
     for (size_t i = 0; src[i] && j + 1 < dst_size; i++) {
         unsigned char c = (unsigned char)src[i];
         if (c == '"' || c == '\\') {
-            if (j + 2 >= dst_size) break;
+            if (j + 2 >= dst_size) { truncated = 1; break; }
             dst[j++] = '\\';
             dst[j++] = (char)c;
         } else if (c == '\n') {
-            if (j + 2 >= dst_size) break;
+            if (j + 2 >= dst_size) { truncated = 1; break; }
             dst[j++] = '\\'; dst[j++] = 'n';
         } else if (c == '\r') {
-            if (j + 2 >= dst_size) break;
+            if (j + 2 >= dst_size) { truncated = 1; break; }
             dst[j++] = '\\'; dst[j++] = 'r';
         } else if (c == '\t') {
-            if (j + 2 >= dst_size) break;
+            if (j + 2 >= dst_size) { truncated = 1; break; }
             dst[j++] = '\\'; dst[j++] = 't';
         } else if (c < 0x20) {
-            if (j + 6 >= dst_size) break;
+            if (j + 6 >= dst_size) { truncated = 1; break; }
             j += snprintf(dst + j, dst_size - j, "\\u%04x", c);
         } else {
             dst[j++] = (char)c;
+        }
+    }
+    /* v3.5.2 P2-F: buffer 不够时回退到完整 UTF-8 字符边界 */
+    if (truncated || (src[0] && j + 1 >= dst_size)) {
+        size_t k = j;
+        while (k > 0 && ((unsigned char)dst[k-1] & 0xC0) == 0x80) {
+            k--;
+        }
+        if (k > 0) {
+            unsigned char lead = (unsigned char)dst[k-1];
+            size_t needed = 0;
+            if ((lead & 0x80) == 0) {
+                needed = 0;
+            } else if ((lead & 0xE0) == 0xC0) {
+                needed = 1;
+            } else if ((lead & 0xF0) == 0xE0) {
+                needed = 2;
+            } else if ((lead & 0xF8) == 0xF0) {
+                needed = 3;
+            }
+            size_t have = j - k;
+            if (have < needed) {
+                j = k - 1;
+            }
         }
     }
     dst[j] = '\0';
@@ -365,6 +383,51 @@ static void test_json_escape_truncation_safe(void) {
     ASSERT_INT_EQ(9, (int)strlen(out), "small buffer truncates safely");
 }
 
+/* === v3.5.2 P2-F: UTF-8 边界回退测试 ===
+ *
+ * buffer 不够时不应切断 UTF-8 多字节序列,否则 JSON 合法但 UI 里显示乱码。
+ * "测" = 0xE6 0xB5 0x8B (3 字节)
+ * "试" = 0xE8 0xAF 0x95
+ * "设" = 0xE8 0xAE 0xBE
+ * "备" = 0xE5 0xA4 0x87
+ */
+
+static void test_json_escape_utf8_rollback_mid(void) {
+    /* 4 个中文 = 12 字节,dst 只有 10 字节(9 可用 + NUL) → 应该写 3 个完整字符(9 字节),
+     * 不能有残缺的第 4 个字符 */
+    char out[10];
+    json_escape("测试设备", out, sizeof(out));
+    /* 期望 "测试设" = 9 字节 + NUL */
+    ASSERT_INT_EQ(9, (int)strlen(out), "UTF-8 rollback: 9 bytes = 3 complete chars");
+    ASSERT_EQ("测试设", out, "UTF-8 rollback: 3 complete Chinese chars");
+}
+
+static void test_json_escape_utf8_rollback_tight(void) {
+    /* dst 只有 4 字节,最多能放 1 个 3-byte 中文字符 */
+    char out[4];
+    json_escape("测试", out, sizeof(out));
+    /* 期望 "测" = 3 字节 + NUL */
+    ASSERT_INT_EQ(3, (int)strlen(out), "UTF-8 rollback tight: 1 char");
+    ASSERT_EQ("测", out, "UTF-8 rollback tight: first char only");
+}
+
+static void test_json_escape_utf8_no_truncation(void) {
+    /* dst 足够大,不应触发回退 */
+    char out[32];
+    json_escape("测试", out, sizeof(out));
+    ASSERT_EQ("测试", out, "UTF-8 complete in big buffer");
+}
+
+static void test_json_escape_utf8_cant_fit_lead_byte(void) {
+    /* dst 太小,连一个 lead byte 都塞不下会怎样 */
+    char out[3];
+    json_escape("测", out, sizeof(out));
+    /* 3 byte 字符,dst[0..1] 写 lead+cont1,循环条件 j+1<3 让 j 停在 1,然后第 3 字节
+     * 因为 j+1>=3 不写 → j=2 是 continuation byte → 回退到 j=0。
+     * 最终 dst = "" */
+    ASSERT_INT_EQ(0, (int)strlen(out), "UTF-8 too small for even one char → empty");
+}
+
 /* === main === */
 
 int main(void) {
@@ -408,6 +471,12 @@ int main(void) {
     test_json_escape_chinese_unchanged();
     test_json_escape_empty();
     test_json_escape_truncation_safe();
+
+    printf("\n── json_escape UTF-8 边界回退 (v3.5.2 P2-F) ──\n");
+    test_json_escape_utf8_rollback_mid();
+    test_json_escape_utf8_rollback_tight();
+    test_json_escape_utf8_no_truncation();
+    test_json_escape_utf8_cant_fit_lead_byte();
 
     /* 清理 */
     unlink(DEVICE_NAMES_JSON);

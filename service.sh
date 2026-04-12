@@ -136,6 +136,14 @@ log "API server (api/server.sh) disabled for security (v3.4.11 P1-11)"
 # ─── 启动设备检测守护进程（v3.0.0：优先 C daemon hotspotd）─
 # device_detect.sh daemon 内部会优先尝试启动 hotspotd(C)；
 # 若二进制不存在则自动回落到原 shell 轮询（向下兼容）
+#
+# v3.5.2 P0-A 修复:detect.pid 和 hotspotd.pid 不再存同一个 PID。
+# - C daemon 成功接管时,只有 hotspotd.pid 有值,detect.pid 不写
+# - shell fallback 时,只有 detect.pid 有值(device_detect.sh 自己写)
+# - watchdog 优先检查 hotspotd.pid,存在时跳过 detect.pid 检查
+# 根本原因:之前两个 pid 指同一 PID,hotspotd 崩掉后 watchdog 两个
+# if 都触发重启,导致 hotspotd C daemon 和 shell fallback 同时运行,
+# 并发写 devices.json.tmp → JSON 损坏(review P0-A)
 log "Starting device detector (C daemon preferred)..."
 sh $HNC_DIR/bin/device_detect.sh daemon >> $HNC_DIR/logs/detect.log 2>&1 &
 DETECT_SHELL_PID=$!
@@ -144,7 +152,9 @@ sleep 2
 HPID=$(cat $RUN/hotspotd.pid 2>/dev/null)
 if [ -n "$HPID" ] && kill -0 "$HPID" 2>/dev/null; then
     log "C daemon hotspotd running (PID=$HPID)"
-    echo $HPID > $RUN/detect.pid   # 统一用 detect.pid 方便 cleanup
+    # v3.5.2 P0-A:不再 echo $HPID > detect.pid。
+    # C daemon 模式下 detect.pid 应当不存在,让 watchdog 看到"没 detect 需要照料"
+    rm -f "$RUN/detect.pid" 2>/dev/null
 else
     # shell fallback 在 daemon_shell_fallback 里自己写了 detect.pid
     log "Shell daemon fallback running (PID=$DETECT_SHELL_PID)"

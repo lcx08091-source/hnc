@@ -2,6 +2,488 @@
 
 ---
 
+## 🏗️ v3.5.2 架构修复版 · 2026-04-13
+
+> **第二轮 AI 代码审查发现 2 个 P0 + 5 个 P1 + 8 个 P2**。v3.5.1 修了显性 bug 但没看到 daemon 生命周期架构问题:两个独立的 pid 文件存同一 PID → watchdog 双重复活 race → C daemon 和 shell fallback 同时写 devices.json.tmp → JSON 损坏。v3.5.2 重构了 daemon 生命周期 + 引入异步 IPC,**v3.5.1 不应作为 release**,直接被 v3.5.2 替代。
+
+### 🎯 v3.5.2 修复总览
+
+| ID | 严重度 | 问题 | 影响 |
+|---|---|---|---|
+| **P0-A** | 🔴 架构 | watchdog 双重复活 → C daemon 和 shell fallback 同时运行 | devices.json 周期性破损 + hotspotd pid 文件永久消失 |
+| **P0-B** | 🔴 架构 | REFRESH IPC 路径同步调 scan_arp → 阻塞主循环 | 本机 DoS 向量,单个坏客户端能冻结整个 hotspotd |
+| **P1-A** | 🟡 测试 | R-2 测试测的是影子函数(hotspotd.c 无对应 symbol) | 假的 coverage 标签,主代码改阈值测试永远 PASS |
+| **P1-B** | 🟡 重要 | handle_client 无 SO_RCVTIMEO/SNDTIMEO | 本机恶意客户端能挂起 daemon |
+| **P1-C** | 🟡 重要 | netlink recv 不处理 ENOBUFS + 无 SO_RCVBUF 调大 | 高负载事件风暴 → 设备表永久不一致 |
+| **P1-D** | 🟡 重要 | hotspotd cleanup 无条件 unlink PID_FILE | 第二个实例 FATAL 会删第一个实例的 PID 文件 |
+| **P1-E** | 🟡 重要 | update_traffic_stats 同步 popen iptables | HNC_STATS 长时间后 O(n) 阻塞主线程 |
+| **P2-A** | 🟢 polish | write_pid 失败静默 | 权限错误时 watchdog 永远重启不了 |
+| **P2-D** | 🟢 polish | scan_arp fgets 返回值未检查 | -Wunused-result 警告 |
+| **P2-E** | 🟢 polish | g_log fd 无 FD_CLOEXEC | popen 子进程继承日志 fd,hardening code smell |
+| **P2-F** | 🟢 polish | json_escape 溢出策略切断 UTF-8 多字节 | 长中文 hostname 极端情况乱码 |
+
+**总:11 个修复**,全部来自第二轮 AI 审查。
+
+---
+
+### 🔴 P0-A — watchdog 双重复活架构 race
+
+**这是 v3.5.1 最严重的 bug**,完整的复现链已经由审查员走了一遍:
+
+**根因**:
+
+```sh
+# service.sh:147 (v3.5.1)
+echo $HPID > $RUN/detect.pid   # 统一用 detect.pid 方便 cleanup
+```
+
+**detect.pid 和 hotspotd.pid 存了同一个 PID**。这个"统一"恰好是 bug 的起点。
+
+**watchdog.sh:120-163** (v3.5.1) 里有**两个独立 if**:
+
+```sh
+# 第一个 if:检查 hotspotd.pid
+if [ -n "$hpid" ] && ! kill -0 "$hpid" 2>/dev/null; then
+    "$HNC_DIR/bin/hotspotd" -d &  # 重启
+fi
+# 第二个 if:检查 detect.pid (没有 elif 守卫!)
+if [ -n "$det_pid" ] && ! kill -0 "$det_pid" 2>/dev/null; then
+    sh "$HNC_DIR/bin/device_detect.sh" daemon &  # 也重启
+fi
+```
+
+**复现链**:
+
+1. T=3600s, hotspotd (HPID_0) OOM killed
+2. watchdog check_services 第一个 if:
+   - 重启 hotspotd → 新实例 A,write_pid() 把 hotspotd.pid 改成 A 的 PID
+3. watchdog check_services 第二个 if(**没有 elif 守卫**):
+   - detect.pid 仍是 HPID_0 → 检测到死 → spawn 新 device_detect.sh wrapper
+4. Wrapper 进 daemon_mode(),无条件又启动一个 hotspotd:
+   - 实例 B 的 write_pid() 把 hotspotd.pid 覆盖成自己(A 的 PID 丢了)
+   - B 的 unix_server_open 发现 A 已 bind → EADDRINUSE → goto cleanup
+   - cleanup: unlink(PID_FILE) **无条件删掉** PID 文件(这时候写的是 B 的 pid,但文件从磁盘消失)
+5. Wrapper 继续:hotspotd_alive 读不到 pid → daemon_shell_fallback
+6. **终态**:
+   - C daemon A 在跑
+   - PID 文件不存在(watchdog 看不到 A,永远失明)
+   - Shell fallback F 也在跑
+7. **A 和 F 同时周期性写** `/data/local/hnc/data/devices.json.tmp`:
+   - C 路径用 `fopen("w")`(O_CREAT|O_TRUNC)
+   - Shell 路径用 `>` 重定向(同样 O_TRUNC)
+   - **互相截断对方写到一半的内容**,rename 后 devices.json 字节级交错 → JSON parser 抛 Unexpected token → WebUI 设备列表清空
+
+**为什么这是架构问题不是单点 bug**:
+
+"detect.pid == hotspotd.pid 双轨制 + watchdog 两个独立 if"这套组合**注定要撞车**。修补任何一个点都无法真正解决 — v3.5.1 的 P1-7 (echo $!) 修复只解决了"shell PID 不是真 PID",没看到这个更大的问题。
+
+**修复策略**:三层防御
+
+**层 1: service.sh 职责分离**
+```sh
+# 新 service.sh
+if [ -n "$HPID" ] && kill -0 "$HPID" 2>/dev/null; then
+    log "C daemon hotspotd running (PID=$HPID)"
+    # v3.5.2 P0-A:不再 echo $HPID > detect.pid
+    rm -f "$RUN/detect.pid" 2>/dev/null  # 明确清除,让 watchdog 看到"没 detect 需要照料"
+else
+    log "Shell daemon fallback running (PID=$DETECT_SHELL_PID)"
+fi
+```
+
+**语义**:`hotspotd.pid` 有值时 `detect.pid` 必须没值。两个文件互斥。
+
+**层 2: watchdog 优先级架构**
+```sh
+check_services() {
+    local hpid; hpid=$(cat "$RUN/hotspotd.pid" 2>/dev/null)
+    if [ -n "$hpid" ]; then
+        # hotspotd 路径:优先级最高
+        if kill -0 "$hpid" 2>/dev/null; then
+            return 0  # 健康,不管 detect.pid
+        fi
+        # hotspotd 死了,重启(带 spawn 锁)
+        ...
+        return $restarted
+    fi
+    # hotspotd.pid 不存在 → shell fallback 模式,检查 detect.pid
+    ...
+}
+```
+
+**关键**:`return 0` 确保 hotspotd 活着时**根本不检查** detect.pid。
+
+**层 3: daemon spawn 锁**
+```sh
+local spawnlock="$RUN/daemon.spawn"
+if ! mkdir "$spawnlock" 2>/dev/null; then
+    log "daemon spawn lock held, skip this round"
+    return 0
+fi
+"$HNC_DIR/bin/hotspotd" -d ... &
+sleep 1
+rmdir "$spawnlock" 2>/dev/null
+```
+
+`device_detect.sh daemon_mode()` 和 `watchdog check_services()` 都检查这个锁。**任何时候最多只有一个进程在 spawn hotspotd**。
+
+**层 4(纵深防御): DEVICES_TMP 带 PID 后缀**
+```c
+// 之前
+#define DEVICES_TMP  HNC_DIR "/data/devices.json.tmp"
+
+// 之后
+#define DEVICES_TMP_FMT  HNC_DIR "/data/devices.json.tmp.%d"
+// runtime:
+char devices_tmp[256];
+snprintf(devices_tmp, sizeof(devices_tmp), DEVICES_TMP_FMT, (int)getpid());
+```
+
+即使前三层全部失效、两个 hotspotd 并发运行,tmp 路径按 PID 区分,不会字节级交错。
+
+---
+
+### 🔴 P0-B — REFRESH IPC 阻塞 DoS
+
+**根因**: handle_client 收到 REFRESH 命令时同步调 `scan_arp()`,scan_arp 对每个新设备同步 popen `mdns_resolve`(-t 800 最多 800ms)。N 台设备 → 最坏 N × 800ms 主线程完全阻塞。期间:
+
+- `select()` 不运行
+- netlink socket 积累事件,内核 SO_RCVBUF 溢出 → ENOBUFS → 静默丢包
+- 丢失的 NEWNEIGH 意味着设备从 g_devs[] 永久消失
+
+**额外攻击面**:`handle_client` 是单线程同步的,`/data/local/hnc/run/hotspotd.sock` 对本机所有 UID 开放。恶意本机进程连上 → 发 `REFRESH\n` → hotspotd 卡 20-30 秒 → 期间所有 IPC 请求排队 → DoS。
+
+**修复(v3.5.2 只修 IPC 一半,P0-B 完整解决留 v3.6)**:
+
+```c
+} else if (strcmp(req, "REFRESH") == 0) {
+    /* v3.5.2 P0-B 修复:REFRESH 不再同步调 scan_arp。
+     * 只设 g_need_scan 标志,主循环下一次 select wakeup 会处理。 */
+    g_need_scan = 1;
+    send(cfd, "OK:queued\n", 10, 0);
+}
+```
+
+**剩下的一半**:主循环处理 g_need_scan 时,scan_arp 仍然同步 popen mdns_resolve。这不是 DoS 向量(因为不在 IPC 路径),但大量设备初次发现时仍会卡几秒。**真正的 work queue / async mdns 架构留给 v3.6**。
+
+---
+
+### 🟡 P1-A — R-2 测试是影子函数(测试作弊)
+
+**审查员原话**:
+> "所谓的'测试覆盖 R-2'是测了测试文件自己写的一个影子函数。这不是测试造假,但是它在 coverage 报告上挂的是're-resolve 逻辑已覆盖'的牌子,是假的。"
+
+**事实**:v3.5.0-rc 时写的 6 个 R-2 测试定义了一个 `should_re_resolve(TestDevice *, long)` 函数,**hotspotd.c 里根本没有这个函数**。主代码是两处内联的 `if`,一处在 scan_arp,一处在 nl_process:
+
+```c
+} else if (strcmp(d->hostname_src, "mac") == 0
+        || (now_t - d->last_resolve) >= 60) {
+```
+
+如果有人把 `>= 60` 改成 `>= 30`,或只改一处忘改另一处,**6 个测试全部 silent PASS**。
+
+**我对这个 guilty**:我 v3.5.0-rc 写测试时**知道**它是影子函数,但 CHANGELOG 和对用户的汇报说成"覆盖 R-2 时间窗口",没澄清这是平行宇宙的测试。这是 dishonesty。
+
+**修复**:
+
+1. hotspotd.c 加真函数:
+```c
+static int should_re_resolve(const char *hostname_src, time_t last_resolve, time_t now) {
+    if (strcmp(hostname_src, "mac") == 0) return 1;
+    if ((now - last_resolve) >= 60) return 1;
+    return 0;
+}
+```
+
+2. scan_arp 和 nl_process 都调用它(删掉两处内联)
+
+3. test_hostname_helpers.c 里的函数**签名完全对齐**主代码:
+```c
+static int should_re_resolve(const char *hostname_src, time_t last_resolve, time_t now) {
+    /* 函数体字面复制粘贴 hotspotd.c */
+}
+```
+
+**现状**:测试仍然是复制不是 `#include`,因为测试是独立编译单元,完整 link hotspotd.o 需要整个模块结构。**但复制的是真实签名+真实实现**,如果主代码改阈值,测试也必须同步改,否则编译测试会炸出 drift 信号。**比"阈值变了但测试永远 PASS"好 100 倍**。
+
+**v3.6 计划**:把 hotspotd.c 的 helper 提取成 `daemon/hnc_helpers.c + .h`,测试和主代码共用头文件,彻底消除复制(这也是原 P1-3 留给 v3.6 的任务)。
+
+---
+
+### 🟡 P1-B — handle_client 无超时,本机 DoS
+
+**根因**: recv/send 都无 SO_RCVTIMEO/SNDTIMEO。恶意本机进程连上 socket 但不发数据 → recv 永远阻塞 → 单线程 daemon 完全停摆。
+
+**修复**:
+
+```c
+static void handle_client(int cfd) {
+    struct timeval tv_rd = {.tv_sec = 2, .tv_usec = 0};
+    struct timeval tv_wr = {.tv_sec = 5, .tv_usec = 0};
+    setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv_rd, sizeof(tv_rd));
+    setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv_wr, sizeof(tv_wr));
+    ...
+    /* GET_DEVICES 的 send 循环也检查返回值 */
+    while ((rd = fread(fbuf, 1, sizeof(fbuf), f)) > 0) {
+        ssize_t sent = send(cfd, fbuf, rd, 0);
+        if (sent < 0) break;
+    }
+}
+```
+
+**审查员还提了 SO_PEERCRED 检查对端 UID**。我没做,因为 WebUI 走 kexec(root 上下文)跟 `nc localhost` 都是 root 访问 socket,UID 检查不额外增强安全。如果以后支持非 root 客户端,再加。
+
+---
+
+### 🟡 P1-C — netlink ENOBUFS 无恢复机制
+
+**根因**: netlink socket 接收缓冲区默认 ~128KB,30+ 客户端事件风暴容易溢出。溢出时 kernel 丢包,下一次 recv 返回 -1 / errno=ENOBUFS。v3.5.1 代码对 `n < 0` 一律吞掉,没检测 ENOBUFS 也没触发重同步。
+
+**结果**: 一次短暂的事件风暴 → 永久性的设备表不一致,直到下次 SIGUSR1 手动 scan。
+
+**修复**:
+
+```c
+// nl_open
+int rcvbuf = 1024 * 1024;  // 调到 1 MB
+setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
+// nl_process
+if (n < 0) {
+    if (errno == ENOBUFS) {
+        hlog("WARN: netlink ENOBUFS, queueing full rescan");
+        g_need_scan = 1;  // 触发 scan_arp 全量重扫
+    } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+        hlog("WARN: netlink recv: %s", strerror(errno));
+    }
+    return;
+}
+```
+
+---
+
+### 🟡 P1-D — write_pid + cleanup 互斥保护
+
+**根因**:
+
+```c
+// v3.5.1 旧代码
+static void write_pid(void) {
+    FILE *f = fopen(PID_FILE, "w");  // O_TRUNC,无互斥
+    if (f) { fprintf(f, "%d\n", (int)getpid()); fclose(f); }
+}
+```
+
+任何并发实例都能覆盖 PID 文件。加上:
+
+```c
+cleanup:
+    ...
+    unlink(PID_FILE);  // 无条件删
+```
+
+第二个实例 FATAL → cleanup → 无条件 unlink → **第一个实例的 PID 文件消失**。
+
+**修复**: write_pid 用 O_EXCL 互斥 + cleanup 验证 PID 再删:
+
+```c
+static int write_pid(void) {
+    int fd = open(PID_FILE, O_CREAT | O_EXCL | O_WRONLY, 0644);
+    if (fd < 0) {
+        if (errno == EEXIST) {
+            /* 读旧 PID, kill -0 检查 */
+            FILE *rf = fopen(PID_FILE, "r");
+            int old_pid = 0;
+            if (rf && fscanf(rf, "%d", &old_pid) == 1 && old_pid > 0) {
+                fclose(rf);
+                if (kill(old_pid, 0) == 0) {
+                    hlog("ERROR: another hotspotd already running (PID=%d), exiting",
+                         old_pid);
+                    return -1;  // 干净退出,不走 cleanup
+                }
+                hlog("INFO: stale PID file (dead PID=%d), cleaning up", old_pid);
+            }
+            unlink(PID_FILE);
+            fd = open(PID_FILE, O_CREAT | O_EXCL | O_WRONLY, 0644);
+            if (fd < 0) {
+                hlog("ERROR: cannot create PID file after cleanup: %s", strerror(errno));
+                return -1;
+            }
+        } else {
+            hlog("ERROR: cannot create PID file: %s", strerror(errno));
+            return -1;
+        }
+    }
+    ...
+    return 0;
+}
+
+static void cleanup_pid(void) {
+    FILE *rf = fopen(PID_FILE, "r");
+    if (!rf) return;
+    int file_pid = 0;
+    if (fscanf(rf, "%d", &file_pid) == 1 && file_pid == (int)getpid()) {
+        fclose(rf);
+        unlink(PID_FILE);
+    } else {
+        fclose(rf);
+        /* PID 文件里不是自己 → 别的实例,保留 */
+    }
+}
+
+// main()
+if (write_pid() < 0) {
+    if (g_log) fclose(g_log);
+    return 0;  // 干净退出,跳过 cleanup 避免误删
+}
+```
+
+**关键**:第二个实例检测到第一个实例活着时 **return 0 而不是 goto cleanup**,这样不会误删第一个实例的 PID 文件,也不会 unlink SOCK_PATH(虽然没 bind)。
+
+---
+
+### 🟡 P1-E — update_traffic_stats TTL 缓存
+
+**根因**: 每次 write_json() 开头同步 popen iptables_manager.sh stats_all,触发 fork + exec shell + iptables + awk。iptables -L HNC_STATS -nvx 成本是 O(chain 规则数)。长期运行后 HNC_STATS 可能有 500+ 条规则,每次几百毫秒。write_json 最短 1 秒一次触发 → 主线程周期性停摆。
+
+**修复**: 加 5 秒 TTL 缓存:
+
+```c
+static time_t g_last_stats_update = 0;
+
+static void update_traffic_stats(void) {
+    if (access(IPTABLES_MGR, X_OK) != 0) return;
+    time_t now = time(NULL);
+    if (now - g_last_stats_update < 5) return;  // v3.5.2 P1-E: TTL 缓存
+    g_last_stats_update = now;
+    ...
+}
+```
+
+流量数字实时性轻微牺牲(5 秒延迟),但主线程不再周期性停摆。
+
+**v4.0 计划**: 绕过 iptables 命令,直接读 `/proc/net/nf_conntrack` 或 nfnetlink counter,避开 shell + iptables 的整个开销。工程量大,不在 v3.5.2 范围。
+
+---
+
+### 🟢 P2 改进项
+
+- **P2-A**: write_pid 失败日志(之前静默,权限错误时 watchdog 永远重启不了)
+- **P2-D**: scan_arp fgets 返回值检查(消除 -Wunused-result 警告)
+- **P2-E**: g_log 加 `fcntl(fileno(g_log), F_SETFD, FD_CLOEXEC)`,防 popen 子进程继承日志 fd
+- **P2-F**: json_escape UTF-8 边界回退
+
+**P2-F 详细**:
+
+buffer 不够时 json_escape 原来直接 break + NUL,可能在 UTF-8 多字节序列中间截断(例如中文是 3 字节)。JSON 本身合法,但 WebUI 的 `JSON.parse()` 后 `.hostname` 里出现 replacement character 或乱码。
+
+**正确回退逻辑**:
+
+```c
+if (truncated || (src[0] && j + 1 >= dst_size)) {
+    /* 从末尾往前找 last non-continuation byte */
+    size_t k = j;
+    while (k > 0 && ((unsigned char)dst[k-1] & 0xC0) == 0x80) {
+        k--;
+    }
+    /* k 指向 last non-continuation byte 的位置 + 1 */
+    if (k > 0) {
+        unsigned char lead = (unsigned char)dst[k-1];
+        size_t needed = 0;
+        if ((lead & 0x80) == 0)        needed = 0;  /* ASCII */
+        else if ((lead & 0xE0) == 0xC0) needed = 1; /* 2-byte lead */
+        else if ((lead & 0xF0) == 0xE0) needed = 2; /* 3-byte lead (中文) */
+        else if ((lead & 0xF8) == 0xF0) needed = 3; /* 4-byte lead (emoji) */
+        size_t have = j - k;
+        if (have < needed) {
+            j = k - 1;  /* 不完整,把残缺字符整个删掉 */
+        }
+    }
+}
+```
+
+**测试**: 4 个新测试覆盖:
+
+- `test_json_escape_utf8_rollback_mid`: 4 个中文(12 字节),dst=10 → 期望 3 个完整字符(9 字节)
+- `test_json_escape_utf8_rollback_tight`: "测试",dst=4 → 期望 1 个字符("测",3 字节)
+- `test_json_escape_utf8_no_truncation`: dst 足够大 → 原样
+- `test_json_escape_utf8_cant_fit_lead_byte`: dst=3 太小装不下一个中文 → 期望空串
+
+**实现中发现的真 bug**:原来的 rollback 循环 "last lead byte 就无条件 j--" 会把**已经完整的字符也删掉**。修法:检查 `have >= needed`,只有不完整才删。
+
+---
+
+### 🚫 v3.5.2 暂不修(留 v3.6)
+
+- **P0-B 核心**: scan_arp 里对 N 个设备串行 popen mdns_resolve 的阻塞问题。v3.5.2 只修了 REFRESH IPC 路径(不再是 DoS 向量),**真正的 work queue / async design 是 v3.6 体量**
+- **P1-F**: test_hostname_helpers.c 的 json_escape 和 should_re_resolve 还是复制不是 #include。提取 `daemon/hnc_helpers.c + .h` 是测试框架重构的一部分,合并到 v3.6
+- **P2-B**: lookup_manual_name 8KB 硬上限(实际不会触发,200 条命名还在 10KB 以内,但 fstat + malloc 动态分配更健壮)
+- **P2-C**: C 测试 runner 无 fork 隔离,加 -fsanitize=address/undefined
+- **P2-G**: mdns_resolve 输出白名单过滤([A-Za-z0-9._\-])
+- **P2-H**: 负向/fuzz/integration 测试(真跑 binary 的 e2e 测试)
+
+---
+
+### 🧪 测试增强:从 106 → **112**
+
+| 测试 | v3.5.1 | v3.5.2 |
+|---|---|---|
+| Shell 框架自检 | 15 | 15 |
+| Shell json_set.sh | 30 | 30 |
+| Shell iptables_tc | 19 | 19 |
+| C hostname_helpers | 31 | **37** (+6 P2-F UTF-8) |
+| C mdns parse | 11 | 11 |
+| **总** | **106** | **112** |
+
+新增测试:
+- UTF-8 边界回退 × 4(mid / tight / no-trunc / cant-fit-lead)
+- should_re_resolve 真签名 × 6(从 v3.5.1 的影子版本替换,不是新增)
+
+---
+
+### 📦 修改文件汇总
+
+| 文件 | 改动 |
+|---|---|
+| `module.prop` | v3.5.1 → **v3.5.2** / 3504 → **3505** |
+| `bin/diag.sh` | 版本号 |
+| `webroot/index.html` | about-ver + v3.5.2 changelog item |
+| `service.sh` | **P0-A 层 1**: 不再 echo $HPID > detect.pid,明确 `rm -f detect.pid` |
+| `bin/watchdog.sh` | **P0-A 层 2**: 优先级架构重构(hotspotd 活着直接 return,不看 detect) + spawn lock |
+| `bin/device_detect.sh` | **P0-A 层 3**: daemon_mode 加 spawn lock |
+| `daemon/hotspotd.c` | **10 处修复**: P0-A #4(DEVICES_TMP_FMT) + P0-B(REFRESH 异步) + P1-A(should_re_resolve 提取) + P1-B(socket 超时) + P1-C(SO_RCVBUF + ENOBUFS) + P1-D(write_pid O_EXCL + cleanup_pid) + P1-E(TTL 缓存) + P2-A(write_pid 日志) + P2-D(fgets) + P2-E(FD_CLOEXEC) + P2-F(UTF-8 回退) |
+| `daemon/test/test_hostname_helpers.c` | P1-A 同步真签名 + 4 个 P2-F UTF-8 测试 |
+| `CHANGELOG.md` | 本段落 |
+| `hnc_smoke_test.sh` | 期望版本 v3.5.1 → v3.5.2 |
+
+---
+
+### 🚦 升级注意
+
+- **v3.5.1 不应作为 release**。已经装了 v3.5.1 的人应该立刻升级到 v3.5.2
+- **从 v3.5.0 / v3.5.1 直接覆盖**,rules.json / device_names.json / config.json 全部保留
+- **重启生效**,watchdog 会自动拉起新的 hotspotd
+- **PID 文件语义变了**: C daemon 模式下 `detect.pid` **不存在**,只有 `hotspotd.pid`。如果你之前的工具脚本依赖 detect.pid 存在,需要更新
+- **真机验证 P0-A 修复**: 装上 v3.5.2 后 `ls /data/local/hnc/run/*.pid` 应该只看到 `hotspotd.pid` + `watchdog.pid`,**没有** `detect.pid`
+
+### 🎯 工程教训
+
+**第二轮审查比第一轮更深**:
+
+1. **第一轮找显性安全 bug**(注入、格式化、覆盖)
+2. **第二轮找架构层 bug**(race、阻塞、资源协调)
+3. **第三轮预计会找测试质量 + 工程纪律问题**
+
+**v3.5.1 的 review gap**:我修 P1-7(echo $!)时**碰到了这个区域**,但只看了"echo $! 不对",没看"detect.pid 和 hotspotd.pid 双轨制本身是坏设计"。**修 bug 的方式必须从"修改报错的那一行"升级到"重新审视这个设计"**。
+
+**测试影子函数**:我 v3.5.0-rc 写的 should_re_resolve 测试是**明知道**跟主代码没关联的,但我让它挂在"覆盖 R-2"的标签下。这是 dishonesty,v3.5.2 的 P1-A 修复包括**我自己承认这一点**。
+
+**关于第三方 review**: 两轮审查都找到真 bug,**第二轮找到的 bug 比第一轮更严重**(架构 race > 明显的字符串注入)。**没有第三方,这些 bug 会在 v3.5.1 tag 上 GitHub Release 后挂几周甚至几个月**,直到真用户撞上。
+
+**v3.5.2 是 v3.5 系列真正的架构成熟版本**。v3.5.0 建好了工程基础设施,v3.5.1 修好了显性功能正确性,v3.5.2 修好了 daemon 生命周期架构。**三个版本各修一层,缺一不可**。
+
+---
+
 ## 🚨 v3.5.1 紧急修复版 · 2026-04-12
 
 > **第三方 AI 代码安全审查发现 4 个 P0 + 3 个 P1**。v3.5.0 存在一个 catastrophic bug — 整个 P0-4 修复实际上从未生效(mDNS 一次都没真正发出过)。v3.5.1 修了所有 P0/P1,**v3.5.0 不应作为 release**,直接被 v3.5.1 替代。

@@ -450,6 +450,25 @@ daemon_shell_fallback() {
 daemon_mode() {
     log "=== Daemon mode starting ==="
 
+    # v3.5.2 P0-A 修复:daemon spawn 锁防止并发启动两个 hotspotd
+    # (watchdog 重启 hotspotd 的同时,如果 device_detect.sh daemon 也被 spawn,
+    #  两个 path 会各自启动一个 hotspotd 实例,导致 unix socket bind 冲突
+    #  + pid 文件互相覆盖 + devices.json 损坏)
+    local SPAWNLOCK="$HNC_DIR/run/daemon.spawn"
+    local waited=0
+    while ! mkdir "$SPAWNLOCK" 2>/dev/null; do
+        waited=$((waited + 1))
+        if [ $waited -ge 10 ]; then
+            log "WARN: daemon spawn lock timeout after 10s, forcing"
+            rmdir "$SPAWNLOCK" 2>/dev/null
+            mkdir "$SPAWNLOCK" 2>/dev/null
+            break
+        fi
+        sleep 1
+    done
+    # trap 确保进程退出时释放 spawn 锁(注意:daemon_shell_fallback 是长跑 while true,
+    # 但 C daemon 路径会 return 0,spawn 锁必须在 return 之前释放)
+
     if [ -x "$HOTSPOTD_BIN" ]; then
         log "Starting C daemon: $HOTSPOTD_BIN"
         # -d: 后台化（自己 fork），写 PID 到 HOTSPOTD_PID
@@ -458,7 +477,8 @@ daemon_mode() {
         if hotspotd_alive; then
             log "C daemon running (PID=$(cat $HOTSPOTD_PID 2>/dev/null))"
             # C daemon 已接管，本进程可退出
-            # service.sh 不再需要 detect.pid（由 hotspotd.pid 管理）
+            # v3.5.2 P0-A:释放 spawn 锁,让后续 watchdog 重启操作可以进入
+            rmdir "$SPAWNLOCK" 2>/dev/null
             return 0
         fi
         log "WARN: C daemon failed, falling back to shell poll"
@@ -466,6 +486,8 @@ daemon_mode() {
         log "hotspotd binary not found, using shell daemon"
     fi
 
+    # shell fallback 进入长跑,在进入前释放 spawn 锁
+    rmdir "$SPAWNLOCK" 2>/dev/null
     daemon_shell_fallback
 }
 

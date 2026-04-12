@@ -55,7 +55,10 @@
 #define HNC_DIR             "/data/local/hnc"
 #define SOCK_PATH           HNC_DIR "/run/hotspotd.sock"
 #define DEVICES_JSON        HNC_DIR "/data/devices.json"
-#define DEVICES_TMP         HNC_DIR "/data/devices.json.tmp"
+/* v3.5.2 P0-A 修复:tmp 路径带 PID 后缀,避免跟 shell daemon 路径
+ * (bin/device_detect.sh do_scan_shell 用 devices.json.tmp)的字节级冲突。
+ * 虽然 P0-A 主线修复已经让 C daemon 和 shell daemon 不同时运行,这是纵深防御。 */
+#define DEVICES_TMP_FMT     HNC_DIR "/data/devices.json.tmp.%d"
 #define LOG_FILE            HNC_DIR "/logs/hotspotd.log"
 #define PID_FILE            HNC_DIR "/run/hotspotd.pid"
 #define ARP_PROC            "/proc/net/arp"
@@ -162,6 +165,27 @@ static void count_active(void) {
     g_ndev = 0;
     for (int i = 0; i < MAX_DEVICES; i++)
         if (g_devs[i].active) g_ndev++;
+}
+
+/* v3.5.2 P1-A: re-resolve 触发条件提取成真函数
+ *
+ * 之前 scan_arp 和 nl_process 里是内联的 if 判断,导致 test_hostname_helpers.c
+ * 里的 "R-2 测试" 其实是测了测试文件自己写的一个同名 shadow 函数,
+ * hotspotd.c 里根本没有对应的 symbol。第二轮 AI 审查的 P1-A 指出:
+ * "测试覆盖 R-2 逻辑"是假的 coverage 标签。
+ *
+ * 修复:把逻辑抽成一个 static inline 函数,scan_arp 和 nl_process 都调用它,
+ * 测试文件也 #include 这一小段定义或者直接 extern 引用。
+ * 现在如果有人改阈值(60s → 30s),两处调用同时变,测试也真的跑到真代码上。
+ *
+ * 触发条件:
+ *   1) hostname_src 是 "mac" 兜底 → 立即重试(user 可能刚刚命名)
+ *   2) 距上次 resolve >= 60 秒 → 时间窗口过期,可能改名或 mDNS 缓存更新
+ */
+static int should_re_resolve(const char *hostname_src, time_t last_resolve, time_t now) {
+    if (strcmp(hostname_src, "mac") == 0) return 1;
+    if ((now - last_resolve) >= 60) return 1;
+    return 0;
 }
 
 /* ══════════════════════════════════════════════════════════
@@ -295,38 +319,97 @@ static void resolve_hostname(const char *mac, const char *ip,
    JSON 写出（原子 tmp+rename，与原 shell 格式 100% 兼容）
 ══════════════════════════════════════════════════════════ */
 
-/* v3.5.1 P0-2: JSON 字符串转义
+/* v3.5.1 P0-2 + v3.5.2 P2-F: JSON 字符串转义
  * 转义 " \ \n \r \t 和 0x00-0x1f 控制字符。
- * 之前 write_json 用 %s 直接输出 d->hostname,如果 hostname 含 " 或 \(来自
- * lookup_manual_name 解码 device_names.json),JSON 破损 → WebUI 设备列表清空 */
+ *
+ * P0-2 原因:之前 write_json 用 %s 直接输出 d->hostname,含 " 或 \(来自
+ * lookup_manual_name 解码 device_names.json)→ JSON 破损 → WebUI 设备列表清空
+ *
+ * P2-F 原因:当 dst 空间不够时原 break 策略会在 UTF-8 多字节序列中间截断,
+ * 留下孤立的 continuation bytes(0x80-0xBF),JSON 本身合法但 UI JSON.parse
+ * 后 .hostname 里出现 replacement character 或乱码。
+ * 修复:回退 UTF-8 边界后才写 NUL。
+ *
+ * UTF-8 规则回顾:
+ *   0xxxxxxx             ASCII(1 字节)
+ *   110xxxxx 10xxxxxx    2 字节
+ *   1110xxxx 10xxxxxx × 2   3 字节(中文)
+ *   11110xxx 10xxxxxx × 3   4 字节(emoji 等)
+ *   10xxxxxx 是 continuation byte
+ *   回退规则:从末尾往前扫,跳过所有 10xxxxxx 的 byte,直到找到一个 non-continuation。
+ */
 static void json_escape(const char *src, char *dst, size_t dst_size) {
     if (dst_size == 0) return;
     size_t j = 0;
+    int truncated = 0;
     /* 循环条件 j + 1 < dst_size: 留 1 字节给末尾 NUL。
      * 每个 escape 分支自己再检查需要的额外字节,不够就 break。 */
     for (size_t i = 0; src[i] && j + 1 < dst_size; i++) {
         unsigned char c = (unsigned char)src[i];
         if (c == '"' || c == '\\') {
-            if (j + 2 >= dst_size) break;  /* 需要 2 字节 + NUL */
+            if (j + 2 >= dst_size) { truncated = 1; break; }
             dst[j++] = '\\';
             dst[j++] = (char)c;
         } else if (c == '\n') {
-            if (j + 2 >= dst_size) break;
+            if (j + 2 >= dst_size) { truncated = 1; break; }
             dst[j++] = '\\'; dst[j++] = 'n';
         } else if (c == '\r') {
-            if (j + 2 >= dst_size) break;
+            if (j + 2 >= dst_size) { truncated = 1; break; }
             dst[j++] = '\\'; dst[j++] = 'r';
         } else if (c == '\t') {
-            if (j + 2 >= dst_size) break;
+            if (j + 2 >= dst_size) { truncated = 1; break; }
             dst[j++] = '\\'; dst[j++] = 't';
         } else if (c < 0x20) {
-            if (j + 6 >= dst_size) break;  /* 需要 6 字节 + NUL */
+            if (j + 6 >= dst_size) { truncated = 1; break; }
             j += snprintf(dst + j, dst_size - j, "\\u%04x", c);
         } else {
-            /* 普通 ASCII 或多字节 UTF-8 字节,1 字节 */
+            /* 普通 ASCII 或 UTF-8 字节,1 字节 */
             dst[j++] = (char)c;
         }
     }
+
+    /* v3.5.2 P2-F: 如果因 buffer 不够退出,且原串没读完,
+     * 回退到最近一个完整 UTF-8 字符边界。
+     *
+     * 正确做法:从当前位置往前扫,找最后一个 non-continuation byte(lead byte 或 ASCII)。
+     * 检查从它开始的字符是不是已经完整写入:
+     *   - ASCII (0xxxxxxx): 本身完整,保留
+     *   - 2-byte lead (110xxxxx): 需要后续 1 个 continuation,检查 dst[j-1] 是不是 continuation
+     *   - 3-byte lead (1110xxxx): 需要后续 2 个 continuation
+     *   - 4-byte lead (11110xxx): 需要后续 3 个 continuation
+     * 如果完整,保留;不完整,回退把整个残缺字符删掉。
+     */
+    if (truncated || (src[0] && j + 1 >= dst_size)) {
+        /* 从末尾往前找 last non-continuation byte */
+        size_t k = j;
+        while (k > 0 && ((unsigned char)dst[k-1] & 0xC0) == 0x80) {
+            k--;
+        }
+        /* k 现在指向 last non-continuation byte 的位置 + 1
+         * 即 dst[k-1] 是 ASCII 或 lead byte */
+        if (k > 0) {
+            unsigned char lead = (unsigned char)dst[k-1];
+            size_t needed = 0;
+            if ((lead & 0x80) == 0) {
+                needed = 0;  /* ASCII,完整 */
+            } else if ((lead & 0xE0) == 0xC0) {
+                needed = 1;  /* 2-byte,需要 1 continuation */
+            } else if ((lead & 0xF0) == 0xE0) {
+                needed = 2;  /* 3-byte,需要 2 continuation */
+            } else if ((lead & 0xF8) == 0xF0) {
+                needed = 3;  /* 4-byte,需要 3 continuation */
+            }
+            /* dst[k..j-1] 是 continuation bytes,有 (j - k) 个 */
+            size_t have = j - k;
+            if (have >= needed) {
+                /* 最后一个字符完整,j 保持不变 */
+            } else {
+                /* 不完整,把残缺字符整个删掉 */
+                j = k - 1;
+            }
+        }
+    }
+
     dst[j] = '\0';
 }
 
@@ -334,10 +417,22 @@ static void json_escape(const char *src, char *dst, size_t dst_size) {
  * 之前 hotspotd 模式下 rx_bytes/tx_bytes 永远 0 → WebUI 流量统计完全失效。
  * 修复:write_json 之前 popen 一次,把输出按 IP 索引,匹配后填充 d->rx_bytes/tx_bytes。
  * stats_all 输出格式:每行 "<ip> <rx_bytes> <tx_bytes>"
- * 性能:popen + awk + iptables 一次约 50-100ms。配合 R-1 de-bounce(1s 窗口),
- * 实际不会比 shell 路径慢 */
+ *
+ * v3.5.2 P1-E: 加 5 秒 TTL 缓存。
+ * 原因:iptables -L HNC_STATS -nvx 的成本是 O(chain 规则数),长时间运行后
+ * HNC_STATS 可能有 500+ 条规则,每次 popen+awk+iptables 几百毫秒。
+ * write_json 在 de-bounce 触发最短 1 秒一次 → 多次调用被阻塞。
+ * 缓存策略:5 秒内重复调用直接 return,流量数字实时性轻微牺牲但主线程不停摆。
+ */
+static time_t g_last_stats_update = 0;
+
 static void update_traffic_stats(void) {
     if (access(IPTABLES_MGR, X_OK) != 0) return;
+
+    /* v3.5.2 P1-E: 5 秒 TTL 缓存 */
+    time_t now = time(NULL);
+    if (now - g_last_stats_update < 5) return;
+    g_last_stats_update = now;
 
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "sh %s stats_all 2>/dev/null", IPTABLES_MGR);
@@ -400,8 +495,12 @@ static void write_json(void) {
         }
     }
 
-    FILE *f = fopen(DEVICES_TMP, "w");
-    if (!f) { hlog("ERROR: cannot write %s: %s", DEVICES_TMP, strerror(errno)); return; }
+    /* v3.5.2 P0-A: tmp 路径带 PID 后缀,避免跟 shell daemon 冲突 */
+    char devices_tmp[256];
+    snprintf(devices_tmp, sizeof(devices_tmp), DEVICES_TMP_FMT, (int)getpid());
+
+    FILE *f = fopen(devices_tmp, "w");
+    if (!f) { hlog("ERROR: cannot write %s: %s", devices_tmp, strerror(errno)); return; }
 
     fprintf(f, "{");
     int first = 1;
@@ -447,9 +546,10 @@ static void write_json(void) {
     fflush(f);
     fclose(f);
 
-    if (rename(DEVICES_TMP, DEVICES_JSON) != 0)
+    if (rename(devices_tmp, DEVICES_JSON) != 0) {
         hlog("ERROR: rename failed: %s", strerror(errno));
-    else {
+        unlink(devices_tmp);  /* 清理失败的 tmp */
+    } else {
         count_active();
         g_last_write = time(NULL);
         g_dirty = 0;
@@ -466,7 +566,11 @@ static void scan_arp(void) {
 
     char line[256];
     int  updated = 0;
-    fgets(line, sizeof(line), f); /* 跳过表头 */
+    /* v3.5.2 P2-D: 显式消费 fgets 返回值,不然 -Wunused-result 会报警 */
+    if (fgets(line, sizeof(line), f) == NULL) {
+        fclose(f);
+        return;  /* /proc/net/arp 读不到表头 → 直接退出 */
+    }
 
     while (fgets(line, sizeof(line), f)) {
         char ip[IP_STR_LEN], hw[8], flags[8], mac[MAC_STR_LEN], mask[8], iface[IF_LEN];
@@ -494,12 +598,9 @@ static void scan_arp(void) {
                              d->hostname, sizeof(d->hostname),
                              d->hostname_src, sizeof(d->hostname_src));
             d->last_resolve = now_t;
-        } else if (strcmp(d->hostname_src, "mac") == 0
-                || (now_t - d->last_resolve) >= 60) {
-            /* v3.5.0-rc R-2: re-resolve 触发条件
-             *   1) hostname_src 是 mac 兜底 → user 可能刚刚命名(立即重试)
-             *   2) 距上次 resolve 超过 60s → user 可能改名 / mDNS 缓存可能更新
-             * 60s 窗口避免每次 ARP scan 都跑 popen mDNS(性能) */
+        } else if (should_re_resolve(d->hostname_src, d->last_resolve, now_t)) {
+            /* v3.5.0-rc R-2 + v3.5.2 P1-A:
+             * re-resolve 条件提取成真函数(之前是内联,测试是影子函数) */
             resolve_hostname(mac, ip,
                              d->hostname, sizeof(d->hostname),
                              d->hostname_src, sizeof(d->hostname_src));
@@ -530,6 +631,13 @@ static int nl_open(void) {
     int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
     if (fd < 0) { hlog("ERROR: netlink socket: %s", strerror(errno)); return -1; }
 
+    /* v3.5.2 P1-C: 把 netlink 接收缓冲区调到 1 MB,减少高负载下的
+     * ENOBUFS 丢包。默认约 128 KB,30+ 客户端时一次事件风暴就可能溢出。 */
+    int rcvbuf = 1024 * 1024;
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {
+        hlog("WARN: netlink SO_RCVBUF failed: %s", strerror(errno));
+    }
+
     struct sockaddr_nl sa = {
         .nl_family = AF_NETLINK,
         .nl_groups = RTMGRP_NEIGH,   /* 只监听邻居表变化 */
@@ -545,7 +653,18 @@ static int nl_open(void) {
 static void nl_process(int fd) {
     char buf[8192];
     ssize_t n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
-    if (n <= 0) return;
+    if (n < 0) {
+        /* v3.5.2 P1-C: 处理 ENOBUFS — netlink kernel buffer 溢出,丢包了,
+         * 触发一次全量 scan_arp 重同步设备表,不然有设备会永久从视角消失 */
+        if (errno == ENOBUFS) {
+            hlog("WARN: netlink ENOBUFS, queueing full rescan");
+            g_need_scan = 1;
+        } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            hlog("WARN: netlink recv: %s", strerror(errno));
+        }
+        return;
+    }
+    if (n == 0) return;
 
     struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
     for (; NLMSG_OK(nlh, (unsigned)n); nlh = NLMSG_NEXT(nlh, n)) {
@@ -604,10 +723,8 @@ static void nl_process(int fd) {
                                  d->hostname, sizeof(d->hostname),
                                  d->hostname_src, sizeof(d->hostname_src));
                 d->last_resolve = now_t;
-            } else if (strcmp(d->hostname_src, "mac") == 0
-                    || (now_t - d->last_resolve) >= 60) {
-                /* v3.5.0-rc R-2: 同 scan_arp 路径,60s 时间窗口 re-resolve
-                 * 触发场景:1) mac 兜底立即重试 2) 改名 60s 内生效 */
+            } else if (should_re_resolve(d->hostname_src, d->last_resolve, now_t)) {
+                /* v3.5.0-rc R-2 + v3.5.2 P1-A: 跟 scan_arp 共用 should_re_resolve */
                 resolve_hostname(mac_str, ip_str,
                                  d->hostname, sizeof(d->hostname),
                                  d->hostname_src, sizeof(d->hostname_src));
@@ -651,6 +768,15 @@ static int unix_server_open(void) {
 }
 
 static void handle_client(int cfd) {
+    /* v3.5.2 P1-B: 加读写超时防止恶意客户端挂起主线程
+     * - 2 秒读超时:客户端连上但不发数据 → recv 超时后 close
+     * - 5 秒写超时:客户端慢读或不读 → send 超时后 close
+     * 之前没超时,一个坏客户端就能 DoS 整个 hotspotd */
+    struct timeval tv_rd = {.tv_sec = 2, .tv_usec = 0};
+    struct timeval tv_wr = {.tv_sec = 5, .tv_usec = 0};
+    setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv_rd, sizeof(tv_rd));
+    setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv_wr, sizeof(tv_wr));
+
     char req[64] = {0};
     ssize_t n = recv(cfd, req, sizeof(req)-1, 0);
     if (n <= 0) { close(cfd); return; }
@@ -666,16 +792,19 @@ static void handle_client(int cfd) {
         else {
             char fbuf[65536];
             size_t rd;
-            while ((rd = fread(fbuf, 1, sizeof(fbuf), f)) > 0)
-                send(cfd, fbuf, rd, 0);
+            while ((rd = fread(fbuf, 1, sizeof(fbuf), f)) > 0) {
+                /* v3.5.2 P1-B: 检查 send 返回值,失败就 break(客户端断连 / 超时) */
+                ssize_t sent = send(cfd, fbuf, rd, 0);
+                if (sent < 0) break;
+            }
             fclose(f);
         }
     } else if (strcmp(req, "REFRESH") == 0) {
-        /* 立即 ARP 扫描（同 SIGUSR1 效果）*/
-        scan_arp();
-        char resp[32];
-        snprintf(resp, sizeof(resp), "OK:%d\n", g_ndev);
-        send(cfd, resp, strlen(resp), 0);
+        /* v3.5.2 P0-B 修复:REFRESH 不再同步调 scan_arp(那会 popen
+         * mdns_resolve × N 设备,主线程阻塞几秒到几十秒)。
+         * 只设 g_need_scan 标志,主循环下一次 select wakeup 会处理。 */
+        g_need_scan = 1;
+        send(cfd, "OK:queued\n", 10, 0);
     } else if (strcmp(req, "STATUS") == 0) {
         char resp[128];
         snprintf(resp, sizeof(resp), "running:1 devices:%d pid:%d\n",
@@ -699,9 +828,75 @@ static void sig_term(int s) { (void)s; g_running   = 0; }
 /* ══════════════════════════════════════════════════════════
    PID 文件
 ══════════════════════════════════════════════════════════ */
-static void write_pid(void) {
-    FILE *f = fopen(PID_FILE, "w");
-    if (f) { fprintf(f, "%d\n", (int)getpid()); fclose(f); }
+
+/* v3.5.2 P1-D + P2-A:
+ * 1) write_pid 用 O_CREAT|O_EXCL 原子创建,如果文件已存在:
+ *    - 读出旧 PID,kill -0 检查活不活
+ *    - 活着 → 返回 -1 让 main 退出(不做 cleanup 避免误删别人的文件)
+ *    - 死了 → unlink 旧文件,重试 O_EXCL 创建
+ * 2) fopen/write 失败时打日志而不是静默
+ *
+ * 防止的场景:watchdog 重启 hotspotd 时并发拉起两个实例,
+ * 第二个实例 O_EXCL 失败,检测到第一个实例活着 → 干净退出,
+ * 不会 unlink 第一个实例的 PID 文件。
+ */
+static int write_pid(void) {
+    int fd = open(PID_FILE, O_CREAT | O_EXCL | O_WRONLY, 0644);
+    if (fd < 0) {
+        if (errno == EEXIST) {
+            /* 文件已存在,检查里面的 PID 是否还活着 */
+            FILE *rf = fopen(PID_FILE, "r");
+            if (rf) {
+                int old_pid = 0;
+                if (fscanf(rf, "%d", &old_pid) == 1 && old_pid > 0) {
+                    fclose(rf);
+                    if (kill(old_pid, 0) == 0) {
+                        /* 旧进程还活着,不要继续 */
+                        hlog("ERROR: another hotspotd already running (PID=%d), exiting",
+                             old_pid);
+                        return -1;
+                    }
+                    /* 旧进程死了,清理 stale 文件 */
+                    hlog("INFO: stale PID file (dead PID=%d), cleaning up", old_pid);
+                } else {
+                    fclose(rf);
+                    hlog("WARN: PID file exists but unreadable, cleaning up");
+                }
+            }
+            unlink(PID_FILE);
+            /* 重试 O_EXCL 创建 */
+            fd = open(PID_FILE, O_CREAT | O_EXCL | O_WRONLY, 0644);
+            if (fd < 0) {
+                hlog("ERROR: cannot create PID file after cleanup: %s", strerror(errno));
+                return -1;
+            }
+        } else {
+            hlog("ERROR: cannot create PID file: %s", strerror(errno));
+            return -1;
+        }
+    }
+    char buf[32];
+    int n = snprintf(buf, sizeof(buf), "%d\n", (int)getpid());
+    if (write(fd, buf, n) != n) {
+        hlog("WARN: write PID file short/failed: %s", strerror(errno));
+    }
+    close(fd);
+    return 0;
+}
+
+/* v3.5.2 P1-D: cleanup 时验证 PID 文件里的 PID 是不是自己,
+ * 是才删,不是说明别的实例已经 overwrite 了,不要删它的文件 */
+static void cleanup_pid(void) {
+    FILE *rf = fopen(PID_FILE, "r");
+    if (!rf) return;
+    int file_pid = 0;
+    if (fscanf(rf, "%d", &file_pid) == 1 && file_pid == (int)getpid()) {
+        fclose(rf);
+        unlink(PID_FILE);
+    } else {
+        fclose(rf);
+        /* PID 文件里不是自己 → 别的实例,保留 */
+    }
 }
 
 /* ══════════════════════════════════════════════════════════
@@ -729,9 +924,16 @@ int main(int argc, char *argv[]) {
     /* 日志 */
     g_log = fopen(logpath, "a");
     hlog("=== hotspotd %s started (PID=%d) ===", daemonize?"daemon":"fg", (int)getpid());
+    /* v3.5.2 P2-E: g_log 加 FD_CLOEXEC,避免子进程(popen mdns_resolve 等)继承日志 fd */
+    if (g_log) fcntl(fileno(g_log), F_SETFD, FD_CLOEXEC);
 
-    /* PID 文件 */
-    write_pid();
+    /* PID 文件
+     * v3.5.2 P1-D: 如果 write_pid 返回 -1(别的实例还活着),直接退出,
+     * 跳过 cleanup 避免误删别人的 PID 文件 */
+    if (write_pid() < 0) {
+        if (g_log) fclose(g_log);
+        return 0;  /* 干净退出,不走 cleanup */
+    }
 
     /* 信号 */
     signal(SIGUSR1, sig_usr1);
@@ -862,7 +1064,8 @@ cleanup:
     if (g_dirty) write_json();
     if (g_nl_fd  >= 0) close(g_nl_fd);
     if (g_srv_fd >= 0) { close(g_srv_fd); unlink(SOCK_PATH); }
-    unlink(PID_FILE);
+    /* v3.5.2 P1-D: 验证 PID 文件是自己的才 unlink */
+    cleanup_pid();
     if (g_log) { hlog("=== hotspotd stopped ==="); fclose(g_log); }
     return 0;
 }

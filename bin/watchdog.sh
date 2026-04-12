@@ -121,30 +121,58 @@ check_services() {
     local restarted=0
     local now; now=$(date +%s 2>/dev/null) || now=0
 
-    # hotspotd C daemon
+    # ═══════════════════════════════════════════════════════════
+    # v3.5.2 P0-A 修复:优先级检查架构
+    # ═══════════════════════════════════════════════════════════
+    # 之前:两个独立的 if 检查 hotspotd.pid 和 detect.pid,都独立触发重启。
+    # 问题:detect.pid 和 hotspotd.pid 可能存同一个 PID(service.sh 的
+    #      旧逻辑),hotspotd 崩溃后 watchdog 两个 if 都触发 → 同时启动
+    #      C daemon + shell fallback → 并发写 devices.json.tmp → JSON 破损。
+    # 修复:改成优先级架构:
+    #      1) 先检查 hotspotd.pid,如果文件存在且进程活着 → OK,skip detect 检查
+    #      2) hotspotd.pid 文件存在但进程死了 → 重启 hotspotd
+    #      3) hotspotd.pid 文件不存在 → 说明当前是 shell fallback 模式,检查 detect.pid
+    # 这保证在任何一个时刻,watchdog 只关心一个进程,不会"双重复活"。
+    # ═══════════════════════════════════════════════════════════
+
     local hpid; hpid=$(cat "$RUN/hotspotd.pid" 2>/dev/null)
-    if [ -n "$hpid" ] && ! kill -0 "$hpid" 2>/dev/null; then
+    if [ -n "$hpid" ]; then
+        # hotspotd 路径
+        if kill -0 "$hpid" 2>/dev/null; then
+            # hotspotd 健康,什么都不做,也不检查 detect
+            return 0
+        fi
+        # hotspotd 死了,尝试重启
         if [ -x "$HNC_DIR/bin/hotspotd" ]; then
             local since=$((now - HOTSPOTD_LAST_RESTART))
             if [ $since -lt $RESTART_COOLDOWN ]; then
                 log "hotspotd dead but in cooldown (${since}s < ${RESTART_COOLDOWN}s),skip"
-            else
-                log "hotspotd dead, restarting (last=${HOTSPOTD_LAST_RESTART})..."
-                # v3.5.1 P1-7 修复:不再 echo $! > pid 文件,因为 hotspotd -d 会
-                # double-fork 后台化,$! 是 shell 子进程 PID,不是真 hotspotd PID。
-                # hotspotd 自己会 write_pid() 写真 PID 到 /data/local/hnc/run/hotspotd.pid。
-                # 之前两个写法竞争同一文件,可能存的是错的 PID,导致下次 kill -0 失败,
-                # 触发重启风暴(虽然有 60s cooldown 兜底,但根本上不该有这个 race)。
-                "$HNC_DIR/bin/hotspotd" -d >> "$HNC_DIR/logs/hotspotd.log" 2>&1 &
-                # 等 hotspotd 自己写 PID 文件(通常 < 100ms)
-                sleep 1
-                HOTSPOTD_LAST_RESTART=$now
-                restarted=1
+                return 0
             fi
+            log "hotspotd dead, restarting (last=${HOTSPOTD_LAST_RESTART})..."
+            # v3.5.2 P0-A:加 daemon spawn 锁防止并发启动两个 hotspotd
+            local spawnlock="$RUN/daemon.spawn"
+            if ! mkdir "$spawnlock" 2>/dev/null; then
+                # 另一个进程正在 spawn,跳过这一轮
+                log "daemon spawn lock held, skip this round"
+                return 0
+            fi
+            # v3.5.1 P1-7:不再 echo $! > pid(hotspotd -d double-fork 后 $! 不是真 PID)
+            # v3.5.2 P0-A:spawn lock 保护
+            "$HNC_DIR/bin/hotspotd" -d >> "$HNC_DIR/logs/hotspotd.log" 2>&1 &
+            sleep 1
+            rmdir "$spawnlock" 2>/dev/null
+            HOTSPOTD_LAST_RESTART=$now
+            restarted=1
+        else
+            # hotspotd.pid 存在但 binary 不见了 → 清掉 stale pid,让下次走 detect 分支
+            rm -f "$RUN/hotspotd.pid"
+            log "hotspotd binary missing, cleared stale pid file"
         fi
+        return $restarted
     fi
 
-    # device_detect shell daemon (fallback)
+    # hotspotd.pid 不存在:当前应该是 shell fallback 模式,检查 detect.pid
     local det_pid; det_pid=$(cat "$RUN/detect.pid" 2>/dev/null)
     if [ -n "$det_pid" ] && ! kill -0 "$det_pid" 2>/dev/null; then
         local since=$((now - DETECT_LAST_RESTART))
@@ -152,10 +180,16 @@ check_services() {
             log "Detector dead but in cooldown (${since}s),skip"
         else
             log "Detector dead, restarting..."
-            sh "$HNC_DIR/bin/device_detect.sh" daemon >> "$HNC_DIR/logs/detect.log" 2>&1 &
-            echo $! > "$RUN/detect.pid"
-            DETECT_LAST_RESTART=$now
-            restarted=1
+            # 同样加 spawn 锁
+            local spawnlock="$RUN/daemon.spawn"
+            if mkdir "$spawnlock" 2>/dev/null; then
+                sh "$HNC_DIR/bin/device_detect.sh" daemon >> "$HNC_DIR/logs/detect.log" 2>&1 &
+                echo $! > "$RUN/detect.pid"
+                sleep 1
+                rmdir "$spawnlock" 2>/dev/null
+                DETECT_LAST_RESTART=$now
+                restarted=1
+            fi
         fi
     fi
 

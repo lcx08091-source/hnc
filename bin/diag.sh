@@ -1,8 +1,8 @@
 #!/system/bin/sh
 
-# v3.5.1 alpha-0: PATH 健壮性,见 service.sh
+# v3.5.2 alpha-0: PATH 健壮性,见 service.sh
 [ -z "$HNC_SKIP_PATH_HARDENING" ] && [ -z "$HNC_TEST_MODE" ] && export PATH=/system/bin:/system/xbin:/vendor/bin:$PATH
-# diag.sh — HNC v3.5.1 自检脚本
+# diag.sh — HNC v3.5.2 自检脚本
 #
 # 用法:
 #   sh /data/local/hnc/bin/diag.sh
@@ -35,7 +35,7 @@ fail() { FAIL=$((FAIL+1)); RESULTS="$RESULTS$1|FAIL|$2
 
 [ $JSON_MODE -eq 0 ] && {
     echo ""
-    echo "  HNC v3.5.1 自检"
+    echo "  HNC v3.5.2 自检"
     echo "  ──────────────────────────────────────────────"
 }
 
@@ -181,7 +181,7 @@ fi
 # ── 汇总输出 ────────────────────────────────────────────
 if [ $JSON_MODE -eq 1 ]; then
     # JSON 输出
-    printf '{"version":"v3.5.1","pass":%d,"warn":%d,"fail":%d,"checks":[' "$PASS" "$WARN" "$FAIL"
+    printf '{"version":"v3.5.2","pass":%d,"warn":%d,"fail":%d,"checks":[' "$PASS" "$WARN" "$FAIL"
     FIRST=1
     echo "$RESULTS" | while IFS='|' read -r name status detail; do
         [ -z "$name" ] && continue
