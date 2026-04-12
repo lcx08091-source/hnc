@@ -1,0 +1,7 @@
+{
+  "api_port": 8080,
+  "hotspot_iface": "auto",
+  "poll_interval": 3,
+  "watchdog_interval": 10,
+  "log_level": "info"
+}
