@@ -1,7 +1,7 @@
 id=hotspot_network_control
 name=Hotspot Network Control
-version=v3.7.0
-versionCode=3700
+version=v3.7.1
+versionCode=3701
 author=Claude (Anthropic AI)
-description=热点设备管控 v3.7.0 · 新增 DHCP hostname 自动识别。通过 dumpsys network_stack 从 Android 14+ 的 NetworkStack ring buffer 提取 DHCP option 12(Host Name),Windows/小米/华为等 OEM 设备会自动显示真实名字(Mi-10, DESKTOP-ABC 等)。hostname 优先级链:manual > dhcp > mdns > mac。35ms 耗时 vs mdns 的 800ms,DHCP 是被动数据零网络成本。两次独立 AI 审查(Gemini + 另一方)共同发现的方案。详见 CHANGELOG.md。
+description=热点设备管控 v3.7.1 · 修复 v3.7.0 的 pending 路径遗漏:process_pending_mdns 之前直接调 try_mdns_resolve 绕过了 DHCP 查询,导致新设备首次识别必须等 60 秒 re-resolve 才能升级到 DHCP hostname。现在 pending 路径调 resolve_hostname 完整链 (manual>dhcp>mdns>mac),新设备首次 pending 处理就拿到正确 hostname。详见 CHANGELOG.md。
 minKernelSU=11485

@@ -673,21 +673,40 @@ static void process_pending_mdns(void) {
 
     if (oldest == NULL) return;
 
-    /* 对这一个设备做同步 mdns 解析(最多 ~800ms) */
+    /* v3.7.1 修复:pending 路径改调 resolve_hostname 完整链
+     *
+     * 之前(v3.6 - v3.7.0):这里直接调 try_mdns_resolve,绕过了 v3.7.0 在
+     * resolve_hostname 里新加的 DHCP 查询路径。结果:新设备首次 pending 处理
+     * 只查 mDNS,不查 DHCP,Mi-10 这种发 DHCP option 12 的设备必须等 60s 后
+     * 的 re-resolve 才能拿到正确 hostname。
+     *
+     * 现在调 resolve_hostname,完整走 manual > dhcp > mdns > mac 链:
+     *   - manual 不会命中(hnc_resolve_hostname_fast 已经在新设备分支试过了)
+     *   - dhcp 命中 (35ms) → hostname_src="dhcp"
+     *   - mdns 兜底 (800ms) → hostname_src="mdns"
+     *   - 都失败 → hostname_src="mac"
+     *
+     * 耗时上 DHCP 查询比 mDNS 快 23 倍(35ms vs 800ms),新设备首次 pending
+     * 处理平均变快而不是变慢(假设大多数客户端是 Windows / 小米 / 华为)。
+     *
+     * 注意:之前的失败分支注释"保持 hostname 不变,因为已经是 mac 兜底值"
+     * 的假设不再需要 — resolve_hostname 的 mac 兜底分支会通过 hnc_mac_fallback
+     * 重新写一次 hostname,和 hnc_resolve_hostname_fast 写的 mac 兜底值一致,
+     * 语义上幂等。*/
     char new_hn[HN_LEN];
-    if (try_mdns_resolve(oldest->ip, oldest->mac, new_hn, sizeof(new_hn))) {
-        /* mdns 成功 */
-        strncpy(oldest->hostname, new_hn, sizeof(oldest->hostname) - 1);
-        oldest->hostname[sizeof(oldest->hostname) - 1] = '\0';
-        snprintf(oldest->hostname_src, sizeof(oldest->hostname_src), "mdns");
-        hlog("pending→mdns: %s (%s) → %s",
-             oldest->mac, oldest->ip, oldest->hostname);
-    } else {
-        /* mdns 失败,降级为 mac 兜底(保持 hostname 不变,因为已经是 mac 兜底值) */
-        snprintf(oldest->hostname_src, sizeof(oldest->hostname_src), "mac");
-        hlog("pending→mac: %s (%s) mdns failed, using fallback",
-             oldest->mac, oldest->ip);
-    }
+    char new_src[32];
+    resolve_hostname(oldest->mac, oldest->ip,
+                     new_hn, sizeof(new_hn),
+                     new_src, sizeof(new_src));
+
+    strncpy(oldest->hostname, new_hn, sizeof(oldest->hostname) - 1);
+    oldest->hostname[sizeof(oldest->hostname) - 1] = '\0';
+    strncpy(oldest->hostname_src, new_src, sizeof(oldest->hostname_src) - 1);
+    oldest->hostname_src[sizeof(oldest->hostname_src) - 1] = '\0';
+
+    hlog("pending→%s: %s (%s) → %s",
+         new_src, oldest->mac, oldest->ip, oldest->hostname);
+
     oldest->last_resolve = now;
     oldest->pending_since = 0;  /* 清除 pending 状态 */
     g_dirty = 1;

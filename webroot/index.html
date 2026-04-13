@@ -1430,10 +1430,33 @@ html,body { min-height:100%; background:var(--bg); color:var(--t0); font-family:
         <div class="about-name">HNC · Hotspot Network Control</div>
         <div class="about-author">作者：Claude (Anthropic AI) &nbsp;·&nbsp; KSU / Magisk 模块</div>
       </div>
-      <span class="about-ver">v3.7.0</span>
+      <span class="about-ver">v3.7.1</span>
     </div>
     <!-- 更新日志 -->
     <div class="changelog">
+
+      <!-- v3.7.1 pending 路径 DHCP 修复（默认展开）-->
+      <div class="cl-item">
+        <div class="cl-left">
+          <div class="cl-dot"></div>
+          <div class="cl-line"></div>
+        </div>
+        <div class="cl-right">
+          <div class="cl-title">🔧 v3.7.1 pending 路径 DHCP 查询修复 &nbsp;<span style="font-size:11px;color:var(--t2);font-weight:400">2026-04-13</span></div>
+          <div class="cl-tags">
+            <span class="cl-tag fix" style="background:#dc2626;color:#fff">v3.7.0 bug 修复</span>
+            <span class="cl-tag fix">装机瞬间识别</span>
+          </div>
+          <ul class="cl-changes">
+            <li><b>🔧 bug 修复</b>:v3.7.0 在 <code>resolve_hostname()</code> 里加了 DHCP 查询,但 <b>忘了同步更新 <code>process_pending_mdns()</code></b> — 它还在直接调 <code>try_mdns_resolve</code>,绕过了 DHCP 查询路径。结果:新设备首次 pending 处理只查 mDNS,不查 DHCP,Mi-10 等发 option 12 的设备必须等 60 秒 re-resolve 才能拿到正确 hostname</li>
+            <li><b>💥 症状</b>:装机后打开 WebUI,Mi-10 先显示 "Android"(mDNS 返回的通用名),60 秒后才变成 "Mi-10"(DHCP 路径)。v3.7.1 修复后装机瞬间就是 "Mi-10"</li>
+            <li><b>🎯 修复</b>:<code>process_pending_mdns</code> 改调 <code>resolve_hostname</code> 完整链(manual > dhcp > mdns > mac),不再直接调 <code>try_mdns_resolve</code>。改动 15 行 C</li>
+            <li><b>⚡ 性能顺带改进</b>:DHCP 查询 35ms vs mDNS 800ms。大多数客户端(Windows / 小米 / 华为)现在在 pending 路径里更快被识别 — pending 处理平均变快而不是变慢</li>
+            <li><b>🔍 发现过程</b>:通过真机日志 + devices.json 直接数据对比,而不是代码审查。v3.7.0 代码 review 时 6 个 AI 都漏了这个 bug(包括 Claude 自己、Gemini、第二轮深度研究 AI)。**教训**:同步路径和异步路径必须一起改,单测需要覆盖两个入口</li>
+            <li><b>🚦 升级建议</b>:直接覆盖 v3.7.0。装机后 Mi-10 重连一次(或等自然 DHCP 续约,默认 1 小时)会立即显示 dhcp 而不是 mdns。已经缓存了 "Android" 的旧数据不会自动清,重启 hotspotd 会清内存态</li>
+          </ul>
+        </div>
+      </div>
 
       <!-- v3.7.0 DHCP hostname 自动识别（默认展开）-->
       <div class="cl-item">
