@@ -1430,10 +1430,35 @@ html,body { min-height:100%; background:var(--bg); color:var(--t0); font-family:
         <div class="about-name">HNC · Hotspot Network Control</div>
         <div class="about-author">作者：Claude (Anthropic AI) &nbsp;·&nbsp; KSU / Magisk 模块</div>
       </div>
-      <span class="about-ver">v3.8.1</span>
+      <span class="about-ver">v3.8.2</span>
     </div>
     <!-- 更新日志 -->
     <div class="changelog">
+
+      <!-- v3.8.2 调用链真代码集成测试(方案 G) -->
+      <div class="cl-item">
+        <div class="cl-left">
+          <div class="cl-dot"></div>
+          <div class="cl-line"></div>
+        </div>
+        <div class="cl-right">
+          <div class="cl-title">🧪 v3.8.2 调用链真代码集成测试(方案 G) &nbsp;<span style="font-size:11px;color:var(--t2);font-weight:400">2026-04-14</span></div>
+          <div class="cl-tags">
+            <span class="cl-tag feat" style="background:#059669;color:#fff">大 v3.8 阶段 3/6</span>
+            <span class="cl-tag feat">真代码测试</span>
+            <span class="cl-tag feat">零 drift</span>
+          </div>
+          <ul class="cl-changes">
+            <li><b>🧪 B3 调用链真代码集成测试</b>:HACKING.md 坑 20 的最终对策。v3.7.0 坑 16 (process_pending_mdns 绕过 resolve_hostname) 这类跨函数 bug 现在被自动拦截。测试执行的是 hotspotd.c 里 <b>100% 真实</b>的 resolve_hostname 和 resolve_hostname_dhcp_only 机器码,不是 shim 重实现,不是契约文档</li>
+            <li><b>🏗️ 方案 G 工作原理</b>:hotspotd.c 底部把 try_mdns_resolve / try_ns_dhcp_resolve / main 三段用 <code>#ifndef HNC_TEST_MODE</code> 包围,前向声明保留在原位置。test_call_chain.c 定义 HNC_TEST_MODE 然后 <code>#include "../hotspotd.c"</code>,自己提供同名 static 函数作为 mock。编译器把 resolve_hostname 里的 call 指令解析到测试里的 mock 定义。零链接器魔法,零 --wrap,零函数提取</li>
+            <li><b>🔬 方案选择历程(3 次迭代)</b>:方案 E (契约测试 + drift 检测) 被 Gemini 审查识别为 "testing the mock 反模式",废弃。方案 F (GCC <code>--wrap</code>) smoke test 失败——<code>--wrap</code> 只拦截跨 translation unit 的 undefined reference,hotspotd.c 单文件内调用不 work。方案 G 从 Gemini 二次咨询得到,smoke test 验证通过,真代码编译通过,符号表和 v3.8.1 完全一致。**每一步用 smoke test 验证,不盲信"业界最佳实践"**</li>
+            <li><b>📋 27 个真代码测试覆盖</b>:6 级优先级链(T01-T06)+ DHCP/mDNS 命中必须写 cache、manual/OUI 不写 cache(T07-T11)+ dhcp_only 永不查 mDNS(T12-T15)+ cache 兜底 + 优先级高于 OUI(T16-T19)+ LAA MAC 跳 OUI 含 Mi-10 真实 0x7a(T20-T21)+ <b>v3.7.0 坑 16 回归保护</b>(T22-T24,pending 路径 DHCP 命中 Mi-10 不是 Android)+ 空 IP 边界(T25-T27)</li>
+            <li><b>🧩 生产代码零逻辑改动</b>:hotspotd.c 仅物理移动了 3 段代码到文件底部,加了 1 个 <code>#ifndef</code>。生产 binary 的符号表和 v3.8.1 完全一致(nm diff 通过),行为零变化</li>
+            <li><b>🏗️ v3.8.4 pthread 就绪</b>:方案 G 的 mock 函数里可以直接插 <code>usleep()</code> / <code>pthread_yield()</code>,放大时序窗口测试 worker 线程调度。这是 v3.8.4 pthread 异步化的安全网基础</li>
+            <li><b>🧪 测试汇总</b>:210 个测试全过(64 shell + 50 hostname_helpers + 11 mdns_parse + 21 OUI + 37 hostname_cache + 27 call_chain 真代码版)+ 生产编译零 warning</li>
+          </ul>
+        </div>
+      </div>
 
       <!-- v3.8.1 持久化 cache + diag 假警报修复（默认展开）-->
       <div class="cl-item">

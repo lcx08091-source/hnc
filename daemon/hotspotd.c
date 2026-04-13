@@ -210,286 +210,22 @@ static void count_active(void) {
 /* v3.6 Commit 2: lookup_manual_name 已提取到 hnc_helpers.c
  * 调用点用 hnc_lookup_manual_name(mac, DEVICE_NAMES_JSON, out, outlen) */
 
-/* 调 bin/mdns_resolve <ip>,超时 1s
- * v3.5.1 P0-1 修复:之前传 "<ip> <mac>" 两个位置参数,但 mdns_resolve 的
- * argv 解析循环把任何非 flag 参数都赋给 ip,结果 ip 被 mac 覆盖,
- * inet_pton 必然失败,从来没真正发出过 mDNS 查询。
- * 修复:只传 ip,跟 shell 路径(`mdns_resolve -t 800 "$ip"`)一致 */
-static int try_mdns_resolve(const char *ip, const char *mac, char *out, size_t outlen) {
-    (void)mac;  /* 参数保留以兼容调用方,但不传给 binary */
-    if (access(MDNS_RESOLVE_BIN, X_OK) != 0) return 0;
-
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "%s -t 800 %s 2>/dev/null", MDNS_RESOLVE_BIN, ip);
-
-    FILE *pf = popen(cmd, "r");
-    if (!pf) return 0;
-
-    out[0] = '\0';
-    if (fgets(out, outlen, pf) != NULL) {
-        /* 去尾部换行 */
-        size_t l = strlen(out);
-        while (l > 0 && (out[l-1] == '\n' || out[l-1] == '\r')) {
-            out[--l] = '\0';
-        }
-    }
-    int rc = pclose(pf);
-    (void)rc;
-    return (out[0] != '\0') ? 1 : 0;
-}
-
 /* ══════════════════════════════════════════════════════════
- * v3.7.0: try_ns_dhcp_resolve — 从 dumpsys network_stack 提取 hostname
- *
- * Android 14+ 的 NetworkStack mainline module 把所有 DHCP 事件写到
- * 内存 ring buffer,dumpsys network_stack 能 dump 出来。每条事件格式:
- *
- *   2026-04-13T16:43:31 - [wlan2.DHCP] Transmitting DhcpAckPacket with lease
- *     clientId: XXX, hwAddr: 7a:d6:f7:ce:ba:76, netAddr: 10.201.76.69/24,
- *     expTime: 4968921,hostname: Mi-10
- *
- * 只要客户端的 DHCP 包里带 option 12 (Host Name),这里就会出现。
- * 覆盖情况:
- *   - Windows (100%)、OEM Android (小米/华为,~80%)、部分 iOS (~40%)
- *   - 不覆盖:原生 Android (Pixel/LineageOS,Google 隐私移除)
- *
- * 耗时:真机实测 ~35ms (dumpsys binder 调用),输出 ~15 KB。
- *
- * ═══════════════════════════════════════════════════════════
- * v3.7.2 重写:放弃 popen + grep shell 管道,改用 fork + execlp + select
- * ═══════════════════════════════════════════════════════════
- *
- * Gemini 审查发现的 5 个缺陷,一次重构全部修复:
- *
- * 1) [RCE] popen("... | grep -iF %s ...", mac) 如果 mac 绕过白名单
- *    (比如 "11:22:33:44:55:66;reboot",我原来的 i==17 检查没查第 18 个
- *    字符是否是 \0) 就是命令注入。
- *    → 现在加 `mac[17] != '\0'` 严格校验。
- *    → 更重要:改用 execlp 直接 exec dumpsys,彻底抛弃 shell。
- *       MAC 作为 strcasestr 的字符串参数,零 shell 参与,不可能注入。
- *
- * 2) [阻塞] popen 没有超时。如果 system_server 卡死(ColorOS 后台杀手
- *    重载 / Doze 模式 / VPN 重试风暴时常见),dumpsys binder 调用无限挂起,
- *    hotspotd 主线程连带被冻死,watchdog 会误触发重启。
- *    → 改用 select() 硬超时 500ms。超时直接 SIGKILL 子进程。
- *
- * 3) [zombie] popen 原版通过 pclose 回收,但如果未来有人在循环里加
- *    提前 return(比如处理错误),pclose 会被跳过,留下僵尸进程。
- *    → waitpid(pid, ..., 0) 在所有退出路径都收割,零泄漏。
- *
- * 4) [截断] char line[1024] + fgets 对超长行会截断成两半,第二半
- *    可能误命中 "hostname: " 字串,解析到垃圾数据。
- *    → 不再按行读,而是一次性 read 全部到 32KB buffer,strtok_r 按 '\n'
- *       切分。单行长度只受 32KB 限制,真机 15KB 总输出远小于此。
- *
- * 5) [匹配精度] grep -iF <mac> 是裸全串匹配,理论上可能命中把 MAC
- *    当 hostname 的设备的其他字段。
- *    → 加约束:同时匹配 "hwAddr: <mac>" 和 "hostname: "。双锚点。
- *
- * 性能影响:
- *   - 正常路径:35ms (dumpsys 本身) + ~1ms (fork/exec/parse) ≈ 36ms
- *     比 popen 版的 35ms 多 1ms,几乎无感
- *   - 超时路径:最多 500ms,然后 SIGKILL + waitpid,主循环恢复
- *     比原版的"无限阻塞"是天壤之别
- *   - 内存:malloc 32KB 一次,退出前 free,无泄漏
+ * v3.8.2 阶段 3 方案 G: I/O 函数前向声明
+ * 
+ * try_mdns_resolve 和 try_ns_dhcp_resolve 的真实定义被搬到文件底部的
+ * #ifndef HNC_TEST_MODE 块里。这样当 test_call_chain.c 用
+ * #include "hotspotd.c" 的方式构建测试二进制时,定义段被 #ifdef 屏蔽,
+ * 测试文件可以自己提供同名 static mock 定义,编译器会把 resolve_hostname
+ * 里对这两个函数的调用解析到测试里的 mock 上。
+ * 
+ * 生产编译不定义 HNC_TEST_MODE → 真实定义生效,行为完全不变。
  * ══════════════════════════════════════════════════════════ */
-static int try_ns_dhcp_resolve(const char *mac, char *out, size_t outlen) {
-    if (!mac || mac[0] == '\0') return 0;
-    if (!out || outlen == 0) return 0;
+static int try_mdns_resolve(const char *ip, const char *mac,
+                            char *out, size_t outlen) __attribute__((unused));
+static int try_ns_dhcp_resolve(const char *mac,
+                               char *out, size_t outlen) __attribute__((unused));
 
-    /* v3.7.2 修复 P0-1 (Gemini 发现):严格校验 MAC 字符串长度
-     *
-     * 原版 v3.7.0:
-     *   for (i = 0; mac[i] && i < 17; i++) { 白名单 }
-     *   if (i != 17) return 0;
-     *
-     * 漏洞:输入 "11:22:33:44:55:66;reboot" 时,循环校验前 17 个字符
-     * (全合法),i 到达 17 退出循环,if 检查通过。但 mac[17] = ';'
-     * 从未被检查,随后被原版 popen 的 %s 拼进 shell 命令导致 RCE。
-     *
-     * 虽然 v3.7.2 改用 execlp 后不再走 shell(从根本上杜绝了 RCE),
-     * 但白名单校验本身的 bug 仍应修复:防御深度 + 下游可能假设 mac 是
-     * 严格 17 字符 */
-    int i;
-    for (i = 0; mac[i] && i < 17; i++) {
-        char c = mac[i];
-        if (!((c >= '0' && c <= '9') ||
-              (c >= 'a' && c <= 'f') ||
-              (c >= 'A' && c <= 'F') ||
-              c == ':')) {
-            return 0;
-        }
-    }
-    /* 必须精确 17 字符且第 18 个字符是 '\0' */
-    if (i != 17 || mac[17] != '\0') return 0;
-
-    /* ── 1. 创建 pipe + fork ─────────────────────────────── */
-    int pipefd[2];
-    if (pipe(pipefd) == -1) return 0;
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(pipefd[0]);
-        close(pipefd[1]);
-        return 0;
-    }
-
-    if (pid == 0) {
-        /* 子进程:重定向 stdout/stderr 后 exec dumpsys */
-        close(pipefd[0]);                /* 关读端 */
-        dup2(pipefd[1], STDOUT_FILENO);  /* stdout → pipe 写端 */
-        close(pipefd[1]);
-
-        /* 丢弃 stderr 避免 dumpsys 的 warning 污染父进程 log */
-        int devnull = open("/dev/null", O_WRONLY);
-        if (devnull >= 0) {
-            dup2(devnull, STDERR_FILENO);
-            close(devnull);
-        }
-
-        /* 直接 exec dumpsys,无 shell 参与,零注入可能 */
-        execlp("dumpsys", "dumpsys", "network_stack", (char *)NULL);
-        /* exec 失败才会走到这里 */
-        _exit(127);
-    }
-
-    /* ── 2. 父进程:非阻塞读 pipe,select 超时 500ms ─────── */
-    close(pipefd[1]);  /* 父进程不写 pipe */
-
-    /* 设 O_NONBLOCK,配合 select 做超时控制 */
-    int flags = fcntl(pipefd[0], F_GETFL, 0);
-    if (flags >= 0) {
-        (void)fcntl(pipefd[0], F_SETFL, flags | O_NONBLOCK);
-    }
-
-    /* 分配读缓冲区:dumpsys 实测 ~15KB,32KB 足够覆盖波动
-     * 用 malloc 而非栈分配,避免撑爆 hotspotd 主线程的 8KB 栈 */
-    const size_t BUF_CAP = 32 * 1024;
-    char *buffer = (char *)malloc(BUF_CAP);
-    if (!buffer) {
-        close(pipefd[0]);
-        /* 必须 waitpid 收割,否则僵尸进程 */
-        waitpid(pid, NULL, 0);
-        return 0;
-    }
-
-    size_t bytes_read = 0;
-    /* v3.7.2: 500ms 总超时
-     * 真机 dumpsys 正常 35ms,给 14 倍余量应对 system_server 短时抖动。
-     * 超过 500ms 判为"系统卡死",放弃这次查询,避免 hotspotd 被拖死。
-     * 这比 Gemini 建议的 150ms 宽松,但仍远低于 pending 路径原来的
-     * 800ms(try_mdns_resolve)和"无限阻塞"(popen) */
-    const int TIMEOUT_MS = 500;
-    struct timeval deadline;
-    gettimeofday(&deadline, NULL);
-    long deadline_us = (long)deadline.tv_sec * 1000000L + deadline.tv_usec
-                       + (long)TIMEOUT_MS * 1000L;
-
-    while (bytes_read < BUF_CAP - 1) {
-        /* 计算剩余时间 */
-        struct timeval now_tv;
-        gettimeofday(&now_tv, NULL);
-        long now_us = (long)now_tv.tv_sec * 1000000L + now_tv.tv_usec;
-        long remain_us = deadline_us - now_us;
-        if (remain_us <= 0) {
-            /* 超时:SIGKILL 子进程,下面 waitpid 收割 */
-            kill(pid, SIGKILL);
-            break;
-        }
-
-        fd_set readfds;
-        FD_ZERO(&readfds);
-        FD_SET(pipefd[0], &readfds);
-
-        struct timeval tv;
-        tv.tv_sec  = remain_us / 1000000L;
-        tv.tv_usec = remain_us % 1000000L;
-
-        int ret = select(pipefd[0] + 1, &readfds, NULL, NULL, &tv);
-        if (ret < 0) {
-            if (errno == EINTR) continue;  /* 信号打断,重试 */
-            break;                          /* 其他错误放弃 */
-        }
-        if (ret == 0) {
-            /* select 超时:SIGKILL + break */
-            kill(pid, SIGKILL);
-            break;
-        }
-
-        if (FD_ISSET(pipefd[0], &readfds)) {
-            ssize_t n = read(pipefd[0], buffer + bytes_read,
-                            BUF_CAP - bytes_read - 1);
-            if (n > 0) {
-                bytes_read += (size_t)n;
-            } else if (n == 0) {
-                break;  /* EOF:子进程退出,数据读完 */
-            } else {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
-                break;  /* read 错误 */
-            }
-        }
-    }
-    close(pipefd[0]);
-    buffer[bytes_read] = '\0';
-
-    /* v3.7.2: 收割子进程,防僵尸
-     * waitpid 会阻塞直到子进程真的退出。如果上面 kill 了 SIGKILL,
-     * 子进程几乎立刻就死,waitpid 毫秒级返回。如果是正常 EOF 路径,
-     * 子进程本来就退出了,waitpid 立即返回。 */
-    int status;
-    waitpid(pid, &status, 0);
-
-    /* ── 3. 内存中解析 buffer,找 hostname ──────────────── */
-    /* 策略:strtok_r 按 '\n' 切分,每行检查:
-     *   条件 A: strcasestr(line, mac) != NULL      // MAC 大小写不敏感
-     *   条件 B: strstr(line, "hostname: ") != NULL // 有 hostname 字段
-     *
-     * v3.7.2 修复 P3-22:原版 popen 走 `grep -iF <mac>` 是裸全串匹配,
-     * 理论上可能把包含 MAC 作为其他字段值的行误命中(例如某用户把设备
-     * 手动命名为另一台设备的 MAC 字符串)。新版双锚点约束,匹配精度更高。
-     *
-     * 多行取最新:dumpsys ring buffer 按时间顺序,越后面越新 */
-    char latest_hostname[HN_LEN] = "";
-    char *saveptr = NULL;
-    char *line = strtok_r(buffer, "\n", &saveptr);
-    while (line != NULL) {
-        /* 双锚点匹配 */
-        if (strcasestr(line, mac) != NULL &&
-            strstr(line, "hostname: ") != NULL) {
-
-            const char *p = strstr(line, "hostname: ");
-            p += 10;  /* 跳过 "hostname: " */
-
-            /* 提取到 \r / , / 行尾 */
-            char hn[HN_LEN];
-            size_t j = 0;
-            while (*p && *p != '\r' && *p != ',' && j < sizeof(hn) - 1) {
-                hn[j++] = *p++;
-            }
-            hn[j] = '\0';
-
-            /* 去尾部空格/tab */
-            while (j > 0 && (hn[j-1] == ' ' || hn[j-1] == '\t')) {
-                hn[--j] = '\0';
-            }
-
-            if (j > 0) {
-                strncpy(latest_hostname, hn, sizeof(latest_hostname) - 1);
-                latest_hostname[sizeof(latest_hostname) - 1] = '\0';
-            }
-        }
-        line = strtok_r(NULL, "\n", &saveptr);
-    }
-
-    free(buffer);
-
-    if (latest_hostname[0] != '\0') {
-        strncpy(out, latest_hostname, outlen - 1);
-        out[outlen - 1] = '\0';
-        return 1;
-    }
-    return 0;
-}
 
 /* 综合 hostname 解析:manual > dhcp > mdns > mac
  * 填充 out 和 out_src
@@ -1292,6 +1028,299 @@ static void cleanup_pid(void) {
     }
 }
 
+
+/* ══════════════════════════════════════════════════════════
+ * v3.8.2 方案 G: 测试可替换的 I/O 函数定义 + main()
+ * 
+ * 生产编译: 不定义 HNC_TEST_MODE,下面所有代码生效。
+ * 测试编译 (test_call_chain.c 里 #define HNC_TEST_MODE + #include): 
+ *   下面整段被跳过,测试文件自己提供 try_mdns_resolve / try_ns_dhcp_resolve
+ *   的 static 定义,resolve_hostname 调用点会解析到测试 mock。
+ *   main() 也被屏蔽,避免和测试 main() 冲突。
+ * ══════════════════════════════════════════════════════════ */
+#ifndef HNC_TEST_MODE
+
+/* 调 bin/mdns_resolve <ip>,超时 1s
+ * v3.5.1 P0-1 修复:之前传 "<ip> <mac>" 两个位置参数,但 mdns_resolve 的
+ * argv 解析循环把任何非 flag 参数都赋给 ip,结果 ip 被 mac 覆盖,
+ * inet_pton 必然失败,从来没真正发出过 mDNS 查询。
+ * 修复:只传 ip,跟 shell 路径(`mdns_resolve -t 800 "$ip"`)一致 */
+static int try_mdns_resolve(const char *ip, const char *mac, char *out, size_t outlen) {
+    (void)mac;  /* 参数保留以兼容调用方,但不传给 binary */
+    if (access(MDNS_RESOLVE_BIN, X_OK) != 0) return 0;
+
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "%s -t 800 %s 2>/dev/null", MDNS_RESOLVE_BIN, ip);
+
+    FILE *pf = popen(cmd, "r");
+    if (!pf) return 0;
+
+    out[0] = '\0';
+    if (fgets(out, outlen, pf) != NULL) {
+        /* 去尾部换行 */
+        size_t l = strlen(out);
+        while (l > 0 && (out[l-1] == '\n' || out[l-1] == '\r')) {
+            out[--l] = '\0';
+        }
+    }
+    int rc = pclose(pf);
+    (void)rc;
+    return (out[0] != '\0') ? 1 : 0;
+}
+
+/* ══════════════════════════════════════════════════════════
+ * v3.7.0: try_ns_dhcp_resolve — 从 dumpsys network_stack 提取 hostname
+ *
+ * Android 14+ 的 NetworkStack mainline module 把所有 DHCP 事件写到
+ * 内存 ring buffer,dumpsys network_stack 能 dump 出来。每条事件格式:
+ *
+ *   2026-04-13T16:43:31 - [wlan2.DHCP] Transmitting DhcpAckPacket with lease
+ *     clientId: XXX, hwAddr: 7a:d6:f7:ce:ba:76, netAddr: 10.201.76.69/24,
+ *     expTime: 4968921,hostname: Mi-10
+ *
+ * 只要客户端的 DHCP 包里带 option 12 (Host Name),这里就会出现。
+ * 覆盖情况:
+ *   - Windows (100%)、OEM Android (小米/华为,~80%)、部分 iOS (~40%)
+ *   - 不覆盖:原生 Android (Pixel/LineageOS,Google 隐私移除)
+ *
+ * 耗时:真机实测 ~35ms (dumpsys binder 调用),输出 ~15 KB。
+ *
+ * ═══════════════════════════════════════════════════════════
+ * v3.7.2 重写:放弃 popen + grep shell 管道,改用 fork + execlp + select
+ * ═══════════════════════════════════════════════════════════
+ *
+ * Gemini 审查发现的 5 个缺陷,一次重构全部修复:
+ *
+ * 1) [RCE] popen("... | grep -iF %s ...", mac) 如果 mac 绕过白名单
+ *    (比如 "11:22:33:44:55:66;reboot",我原来的 i==17 检查没查第 18 个
+ *    字符是否是 \0) 就是命令注入。
+ *    → 现在加 `mac[17] != '\0'` 严格校验。
+ *    → 更重要:改用 execlp 直接 exec dumpsys,彻底抛弃 shell。
+ *       MAC 作为 strcasestr 的字符串参数,零 shell 参与,不可能注入。
+ *
+ * 2) [阻塞] popen 没有超时。如果 system_server 卡死(ColorOS 后台杀手
+ *    重载 / Doze 模式 / VPN 重试风暴时常见),dumpsys binder 调用无限挂起,
+ *    hotspotd 主线程连带被冻死,watchdog 会误触发重启。
+ *    → 改用 select() 硬超时 500ms。超时直接 SIGKILL 子进程。
+ *
+ * 3) [zombie] popen 原版通过 pclose 回收,但如果未来有人在循环里加
+ *    提前 return(比如处理错误),pclose 会被跳过,留下僵尸进程。
+ *    → waitpid(pid, ..., 0) 在所有退出路径都收割,零泄漏。
+ *
+ * 4) [截断] char line[1024] + fgets 对超长行会截断成两半,第二半
+ *    可能误命中 "hostname: " 字串,解析到垃圾数据。
+ *    → 不再按行读,而是一次性 read 全部到 32KB buffer,strtok_r 按 '\n'
+ *       切分。单行长度只受 32KB 限制,真机 15KB 总输出远小于此。
+ *
+ * 5) [匹配精度] grep -iF <mac> 是裸全串匹配,理论上可能命中把 MAC
+ *    当 hostname 的设备的其他字段。
+ *    → 加约束:同时匹配 "hwAddr: <mac>" 和 "hostname: "。双锚点。
+ *
+ * 性能影响:
+ *   - 正常路径:35ms (dumpsys 本身) + ~1ms (fork/exec/parse) ≈ 36ms
+ *     比 popen 版的 35ms 多 1ms,几乎无感
+ *   - 超时路径:最多 500ms,然后 SIGKILL + waitpid,主循环恢复
+ *     比原版的"无限阻塞"是天壤之别
+ *   - 内存:malloc 32KB 一次,退出前 free,无泄漏
+ * ══════════════════════════════════════════════════════════ */
+static int try_ns_dhcp_resolve(const char *mac, char *out, size_t outlen) {
+    if (!mac || mac[0] == '\0') return 0;
+    if (!out || outlen == 0) return 0;
+
+    /* v3.7.2 修复 P0-1 (Gemini 发现):严格校验 MAC 字符串长度
+     *
+     * 原版 v3.7.0:
+     *   for (i = 0; mac[i] && i < 17; i++) { 白名单 }
+     *   if (i != 17) return 0;
+     *
+     * 漏洞:输入 "11:22:33:44:55:66;reboot" 时,循环校验前 17 个字符
+     * (全合法),i 到达 17 退出循环,if 检查通过。但 mac[17] = ';'
+     * 从未被检查,随后被原版 popen 的 %s 拼进 shell 命令导致 RCE。
+     *
+     * 虽然 v3.7.2 改用 execlp 后不再走 shell(从根本上杜绝了 RCE),
+     * 但白名单校验本身的 bug 仍应修复:防御深度 + 下游可能假设 mac 是
+     * 严格 17 字符 */
+    int i;
+    for (i = 0; mac[i] && i < 17; i++) {
+        char c = mac[i];
+        if (!((c >= '0' && c <= '9') ||
+              (c >= 'a' && c <= 'f') ||
+              (c >= 'A' && c <= 'F') ||
+              c == ':')) {
+            return 0;
+        }
+    }
+    /* 必须精确 17 字符且第 18 个字符是 '\0' */
+    if (i != 17 || mac[17] != '\0') return 0;
+
+    /* ── 1. 创建 pipe + fork ─────────────────────────────── */
+    int pipefd[2];
+    if (pipe(pipefd) == -1) return 0;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return 0;
+    }
+
+    if (pid == 0) {
+        /* 子进程:重定向 stdout/stderr 后 exec dumpsys */
+        close(pipefd[0]);                /* 关读端 */
+        dup2(pipefd[1], STDOUT_FILENO);  /* stdout → pipe 写端 */
+        close(pipefd[1]);
+
+        /* 丢弃 stderr 避免 dumpsys 的 warning 污染父进程 log */
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+
+        /* 直接 exec dumpsys,无 shell 参与,零注入可能 */
+        execlp("dumpsys", "dumpsys", "network_stack", (char *)NULL);
+        /* exec 失败才会走到这里 */
+        _exit(127);
+    }
+
+    /* ── 2. 父进程:非阻塞读 pipe,select 超时 500ms ─────── */
+    close(pipefd[1]);  /* 父进程不写 pipe */
+
+    /* 设 O_NONBLOCK,配合 select 做超时控制 */
+    int flags = fcntl(pipefd[0], F_GETFL, 0);
+    if (flags >= 0) {
+        (void)fcntl(pipefd[0], F_SETFL, flags | O_NONBLOCK);
+    }
+
+    /* 分配读缓冲区:dumpsys 实测 ~15KB,32KB 足够覆盖波动
+     * 用 malloc 而非栈分配,避免撑爆 hotspotd 主线程的 8KB 栈 */
+    const size_t BUF_CAP = 32 * 1024;
+    char *buffer = (char *)malloc(BUF_CAP);
+    if (!buffer) {
+        close(pipefd[0]);
+        /* 必须 waitpid 收割,否则僵尸进程 */
+        waitpid(pid, NULL, 0);
+        return 0;
+    }
+
+    size_t bytes_read = 0;
+    /* v3.7.2: 500ms 总超时
+     * 真机 dumpsys 正常 35ms,给 14 倍余量应对 system_server 短时抖动。
+     * 超过 500ms 判为"系统卡死",放弃这次查询,避免 hotspotd 被拖死。
+     * 这比 Gemini 建议的 150ms 宽松,但仍远低于 pending 路径原来的
+     * 800ms(try_mdns_resolve)和"无限阻塞"(popen) */
+    const int TIMEOUT_MS = 500;
+    struct timeval deadline;
+    gettimeofday(&deadline, NULL);
+    long deadline_us = (long)deadline.tv_sec * 1000000L + deadline.tv_usec
+                       + (long)TIMEOUT_MS * 1000L;
+
+    while (bytes_read < BUF_CAP - 1) {
+        /* 计算剩余时间 */
+        struct timeval now_tv;
+        gettimeofday(&now_tv, NULL);
+        long now_us = (long)now_tv.tv_sec * 1000000L + now_tv.tv_usec;
+        long remain_us = deadline_us - now_us;
+        if (remain_us <= 0) {
+            /* 超时:SIGKILL 子进程,下面 waitpid 收割 */
+            kill(pid, SIGKILL);
+            break;
+        }
+
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(pipefd[0], &readfds);
+
+        struct timeval tv;
+        tv.tv_sec  = remain_us / 1000000L;
+        tv.tv_usec = remain_us % 1000000L;
+
+        int ret = select(pipefd[0] + 1, &readfds, NULL, NULL, &tv);
+        if (ret < 0) {
+            if (errno == EINTR) continue;  /* 信号打断,重试 */
+            break;                          /* 其他错误放弃 */
+        }
+        if (ret == 0) {
+            /* select 超时:SIGKILL + break */
+            kill(pid, SIGKILL);
+            break;
+        }
+
+        if (FD_ISSET(pipefd[0], &readfds)) {
+            ssize_t n = read(pipefd[0], buffer + bytes_read,
+                            BUF_CAP - bytes_read - 1);
+            if (n > 0) {
+                bytes_read += (size_t)n;
+            } else if (n == 0) {
+                break;  /* EOF:子进程退出,数据读完 */
+            } else {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+                break;  /* read 错误 */
+            }
+        }
+    }
+    close(pipefd[0]);
+    buffer[bytes_read] = '\0';
+
+    /* v3.7.2: 收割子进程,防僵尸
+     * waitpid 会阻塞直到子进程真的退出。如果上面 kill 了 SIGKILL,
+     * 子进程几乎立刻就死,waitpid 毫秒级返回。如果是正常 EOF 路径,
+     * 子进程本来就退出了,waitpid 立即返回。 */
+    int status;
+    waitpid(pid, &status, 0);
+
+    /* ── 3. 内存中解析 buffer,找 hostname ──────────────── */
+    /* 策略:strtok_r 按 '\n' 切分,每行检查:
+     *   条件 A: strcasestr(line, mac) != NULL      // MAC 大小写不敏感
+     *   条件 B: strstr(line, "hostname: ") != NULL // 有 hostname 字段
+     *
+     * v3.7.2 修复 P3-22:原版 popen 走 `grep -iF <mac>` 是裸全串匹配,
+     * 理论上可能把包含 MAC 作为其他字段值的行误命中(例如某用户把设备
+     * 手动命名为另一台设备的 MAC 字符串)。新版双锚点约束,匹配精度更高。
+     *
+     * 多行取最新:dumpsys ring buffer 按时间顺序,越后面越新 */
+    char latest_hostname[HN_LEN] = "";
+    char *saveptr = NULL;
+    char *line = strtok_r(buffer, "\n", &saveptr);
+    while (line != NULL) {
+        /* 双锚点匹配 */
+        if (strcasestr(line, mac) != NULL &&
+            strstr(line, "hostname: ") != NULL) {
+
+            const char *p = strstr(line, "hostname: ");
+            p += 10;  /* 跳过 "hostname: " */
+
+            /* 提取到 \r / , / 行尾 */
+            char hn[HN_LEN];
+            size_t j = 0;
+            while (*p && *p != '\r' && *p != ',' && j < sizeof(hn) - 1) {
+                hn[j++] = *p++;
+            }
+            hn[j] = '\0';
+
+            /* 去尾部空格/tab */
+            while (j > 0 && (hn[j-1] == ' ' || hn[j-1] == '\t')) {
+                hn[--j] = '\0';
+            }
+
+            if (j > 0) {
+                strncpy(latest_hostname, hn, sizeof(latest_hostname) - 1);
+                latest_hostname[sizeof(latest_hostname) - 1] = '\0';
+            }
+        }
+        line = strtok_r(NULL, "\n", &saveptr);
+    }
+
+    free(buffer);
+
+    if (latest_hostname[0] != '\0') {
+        strncpy(out, latest_hostname, outlen - 1);
+        out[outlen - 1] = '\0';
+        return 1;
+    }
+    return 0;
+}
+
 /* ══════════════════════════════════════════════════════════
    主函数
 ══════════════════════════════════════════════════════════ */
@@ -1490,3 +1519,5 @@ cleanup:
     if (g_log) { hlog("=== hotspotd stopped ==="); fclose(g_log); }
     return 0;
 }
+
+#endif /* HNC_TEST_MODE */

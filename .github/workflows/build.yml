@@ -61,6 +61,15 @@ jobs:
           gcc -Wall -Wextra -I .. -o test_hostname_cache \
               test_hostname_cache.c ../hostname_cache.c ../hnc_helpers.c
           ./test_hostname_cache
+          # v3.8.2 B3 方案 G: 调用链真代码集成测试
+          # 通过 #include "../hotspotd.c" + 同名 static mock 覆盖 I/O 函数,
+          # 测试执行的是真实 resolve_hostname 机器码,不是 shim 重实现。
+          # -Wno-unused-{function,variable}: hotspotd.c 里 main/nl_fd 等在
+          # HNC_TEST_MODE 下不可用,但 extern 声明会触发未使用警告。
+          gcc -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
+              -Wno-unused-variable -I .. -o test_call_chain \
+              test_call_chain.c ../hnc_helpers.c ../hostname_cache.c
+          ./test_call_chain
 
   build:
     name: Cross-compile binaries

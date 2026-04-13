@@ -859,30 +859,82 @@ int func(void) {
 
 两个函数**单独**测都是绿的,合起来**坏**。这是典型的**单元测试覆盖不到集成问题**。
 
-**应对**: 需要 **调用链级端到端测试**。HNC v3.8.2(阶段 3)计划引入轻量 mock framework,让以下形式的测试可写:
+**应对**: 需要 **调用链级端到端测试**。HNC v3.8.2(阶段 3)已完成对策,采用**方案 G (Include + 同名 static 覆盖)**。
+
+**方案选择历程**(是 v3.8.2 最大的设计决策,记录在案以便未来参考):
+
+第一次尝试: **方案 E (契约测试 + drift 检测)** — 在测试文件里重新实现
+resolve_hostname 的"规范版本",用 mock 驱动,另外写 awk 脚本对比
+hotspotd.c 和测试里的 src 序列。凌晨 3 点选的,**不是好方案**:
+
+- 本质是"shim 复制",两份代码都是执行逻辑
+- drift 检测只看表面字符串,抓不到控制流变化
+- 测的不是真代码
+
+Gemini 审查明确指出方案 E 是"testing the mock 反模式"。
+
+第二次尝试: **方案 F (`-Wl,--wrap` link-time mocking)** — Gemini 推荐。
+**smoke test 失败**:`--wrap` 只能拦截**跨 translation unit** 的
+undefined reference。hotspotd.c 里 `resolve_hostname` 调用
+`try_ns_dhcp_resolve`,两者在同一个 .c 文件里,编译器在 .o 生成阶段
+就把 call 绑定到本文件地址,链接器无从介入。
+
+验证过程:写了一个最小 smoke test,同 TU 时 `--wrap` 完全不工作,
+跨 TU 时工作。objdump 反汇编验证 call 指令直接硬编码本文件地址。
+
+最终方案: **方案 G (Include + 同名 static 覆盖)** — Gemini 二次咨询给的。
+
+- hotspotd.c 顶部加 try_mdns_resolve / try_ns_dhcp_resolve 的 `static` 前向声明
+- 这两个函数的**定义**搬到文件底部,连同 `main()` 一起用 `#ifndef HNC_TEST_MODE` 包围
+- `test_call_chain.c` 定义 `HNC_TEST_MODE` 然后 `#include "../hotspotd.c"`
+- 测试文件自己提供同名 static 函数作为 mock
+- 编译器看到两份定义候选:hotspotd.c 里的被 `#ifdef` 屏蔽,测试里的生效
+- `resolve_hostname` 里的 `call try_ns_dhcp_resolve` 被解析到测试里的 mock
+
+关键优势:
+- **测的是 100% 真实的 resolve_hostname 机器码**,不是 shim 重实现
+- 零 drift 风险(没有复制代码)
+- 生产代码只有 1 处 `#ifndef`,可读性几乎不受影响
+- hotspotd.c 符号表和原版完全一致(nm diff 通过)
+- v3.8.4 pthread 改造时可以扩展:mock 函数里插 `usleep()` 测试线程调度
+
+实际测试代码(27 个测试全过):
 
 ```c
-// 伪代码,v3.8.2 目标
-void test_pending_path_reaches_dhcp(void) {
-    // mock try_ns_dhcp_resolve 返回 "Mi-10"
-    mock_set(try_ns_dhcp_resolve, "Mi-10");
-    
-    // setup pending device
-    Device d = {.hostname_src = "pending", .pending_since = 0, ...};
-    g_devs[0] = d;
-    
-    // 驱动 pending 处理
-    process_pending_mdns();
-    
-    // 验证 pending 路径确实走到了 dhcp
-    assert_str_eq(g_devs[0].hostname, "Mi-10");
-    assert_str_eq(g_devs[0].hostname_src, "dhcp");
+// test_call_chain.c
+#define HNC_TEST_MODE 1
+#include "../hotspotd.c"
+
+/* Mock 定义(替换被 #ifdef 屏蔽的真实定义) */
+static int try_ns_dhcp_resolve(const char *mac, char *out, size_t outlen) {
+    /* 查 g_mock_dhcp 数组... */
+}
+
+int main(void) {
+    mock_dhcp_set("7a:d6:f7:ce:ba:aa", "Mi-10");
+    mock_mdns_set("7a:d6:f7:ce:ba:aa", "Android");
+
+    char hn[64], src[16];
+    resolve_hostname_dhcp_only("7a:d6:f7:ce:ba:aa", hn, 64, src, 16);
+
+    /* 这是真实的 resolve_hostname_dhcp_only,如果它绕过 DHCP 直接调 mDNS,
+     * hn 就会是 "Android" 而非 "Mi-10",坑 16 回归 */
+    assert(strcmp(hn, "Mi-10") == 0);
 }
 ```
 
-如果 v3.7.0 前有这个测试,**process_pending_mdns 绕过 resolve_hostname 的问题会在编译时被抓住**(测试 fail)。
+**元教训 A**: **任何跨函数的关键逻辑都需要"组装测试",而不是只测组件**。
+HNC 的测试策略 v3.8 之后从"单元覆盖"升级为"调用链覆盖"。
 
-**元教训**: **任何跨函数的关键逻辑都需要"组装测试",而不是只测组件**。HNC 的测试策略 v3.8 之后要从"单元覆盖"升级为"调用链覆盖"。
+**元教训 B**: **C 语言的测试方案选择要用 smoke test 验证,不要相信
+"业界最佳实践"的直接推荐**。Gemini 的方案 F 看起来很专业,但在 HNC
+的单文件结构下直接失败。如果没有 30 行的 smoke test,我们会花 1-2 小时
+改 hotspotd.c 然后发现根本跑不起来。
+
+**元教训 C**: **外部 AI 审查是有效的,但不能盲从**。Gemini 第一轮审查
+指出方案 E 是反模式,是对的;但第一轮推荐的方案 F 有 TU 边界假设错误。
+第二轮给出方案 G 才是可行方案。**"严格质疑"和"用数据验证"比"礼貌同意"
+重要**。
 
 ---
 
