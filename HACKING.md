@@ -413,6 +413,532 @@ resolve_hostname(mac, ip, ...);  // ❌ 内部同步 popen mdns_resolve -t 800
 
 ---
 
+### 坑 13: shell 脚本写 tmp 文件**必须**加 `$$` PID 后缀
+
+**事故版本**: **v3.6.0 发布当天(2026-04-13)真机事故**,v3.6.1 修复
+**文件**: `bin/device_detect.sh:do_scan_shell()` 的 json 写入行
+
+**症状**: 用户点"释放所有资源"按钮后,WebUI 设备列表**完全空白**。WebUI 顶部统计显示"在线 N",但下面一个设备卡片都没有。查看 `devices.json`:
+
+```json
+{
+  "e2:0d:4a:48:5d:40": {
+    "ip": "10.118.156.30",
+    "hostname": "mi10",
+    "hostname_src": "manual",
+    "iface": "",                    ← 空字符串
+    "status": "wlan2|allowed"       ← 接口名和 status 被 | 粘在一起
+  }
+}
+```
+
+`iface` 字段是空的,`status` 字段是 `"wlan2|allowed"`(这个值从来不应该出现 — 正常是 `"allowed"` 或 `"blocked"`)。
+
+**根因**: **并发写同一个 tmp 文件的字节级 race condition**。
+
+事故场景:
+1. 用户点"释放所有资源"(09:25:45) → `cleanup.sh` 按预期杀掉 hotspotd + watchdog(这是**正确行为**,不是 bug)
+2. WebUI 检测不到 hotspotd,后续的 `doRefresh` 或用户点"刷新设备列表"触发 `device_detect.sh scan`
+3. 命令 `device_detect.sh scan` 走 `do_scan_shell()` 路径(因为 hotspotd 已死)
+4. shell scan 的执行时间约 5-10 秒(要调 iptables ensure_stats + stats_all + awk /proc/net/arp + 组装 JSON)
+5. 在这窗口内,WebUI 的 2.5 秒 polling 会再次触发 scan → **多个 shell scan 进程并发**
+6. 每个 scan 写到**同一个固定路径** `devices.json.tmp`(**没有 PID 后缀**)
+7. kernel 不保证 `write(2)` 对 regular file 的原子性 → 两个并发 `printf > devices.json.tmp` 的字节流**交错混合**
+8. 最终产生一个"看似合法 JSON,但字段语义错乱"的文件
+
+**为什么错乱成 `"iface":"","status":"wlan2|allowed"`**: 
+两个 scan A 和 B 的 printf 输出在 byte 级交错,A 的 `"iface":"wlan2","rx_bytes":...` 和 B 的 `"iface":"","...","status":"allowed"` 字节混合后,刚好拼出合法 JSON 语法,但 `iface` 变空串、`wlan2|` 被吃进 `status` 字段。这种交错每次都不一样,但**一旦出现,WebUI 的 `cardHTML()` 渲染某些字段(比如 `d.status === 'blocked'` 判断)会产生意外行为**,整个 render loop 抛 TypeError,设备列表变空白。
+
+**修复(v3.6.1)**: tmp 路径加 `$$`(shell PID)后缀:
+
+```sh
+# 旧代码(race condition)
+printf '%s' "$json" > "${DEVICES_FILE}.tmp" && \
+    mv "${DEVICES_FILE}.tmp" "$DEVICES_FILE"
+
+# 新代码(并发安全)
+local tmp_out="${DEVICES_FILE}.tmp.$$"
+printf '%s' "$json" > "$tmp_out" && mv "$tmp_out" "$DEVICES_FILE"
+```
+
+每个 scan 子进程有自己的 PID,tmp 文件路径唯一,**并发 printf 互不干扰**。最后的 `mv` 是原子 rename(kernel 保证),谁后 mv 谁赢(last-write-wins),但每个 tmp 文件本身都是完整合法的 JSON。
+
+**同时更新 trap** 清理以避免进程异常退出时留下 `devices.json.tmp.$$` 文件。
+
+**元教训 A — "纵深防御对齐"**: 
+这个问题 v3.5.2 P0-A 审查**抓到了一半**。当时 hotspotd.c 的 `DEVICES_TMP_FMT` 宏已经改成了 `"devices.json.tmp.%d"`(带 PID 后缀),并且有注释明确写:
+
+> *"v3.5.2 P0-A 修复:tmp 路径带 PID 后缀,避免跟 shell daemon 路径(bin/device_detect.sh do_scan_shell 用 devices.json.tmp)的字节级冲突。"*
+
+**C 侧修了,shell 侧没跟上**。这是**典型的半修复** — 审查员发现了 A 和 B 两条路径的冲突,但只修了 A 侧的防御,觉得"A 和 B 永远不会同时跑"(因为 P0-A 的三层防御机制保证 C daemon 和 shell daemon 互斥)。
+
+**盲点**: "B 和 B 自己并发跑" — 也就是 `device_detect.sh scan` 命令(单次 scan,不是 daemon 模式)可以被**同一时刻多次调用**。WebUI 的 2.5 秒 polling + 用户点刷新按钮,很容易触发这种并发。审查员没想到这个场景。
+
+**元教训 B — "凡是 shell 写 tmp 必须 `$$`"**:
+这是一个**绝对规则**。只要 shell 脚本用 `> file.tmp` 或 `> file.lock` 做"先写临时文件再 mv"模式,**永远**都要加 `$$`:
+
+```sh
+# ❌ 错
+echo "$data" > /tmp/foo.tmp && mv /tmp/foo.tmp /tmp/foo
+
+# ✅ 对
+echo "$data" > /tmp/foo.tmp.$$ && mv /tmp/foo.tmp.$$ /tmp/foo
+```
+
+不管你认为"这个脚本只会被 cron 每分钟调一次不会并发",**用户迟早会想办法让它并发**(点按钮两次、多个终端、watchdog 重启),**规则是规则**,不要找借口。
+
+**元教训 C — "真机事故是最好的 fuzz 测试"**:
+三轮独立 AI 审查都没找到这个 bug。它在沙箱里**没法复现**(因为沙箱单进程跑不了 WebUI polling)。v3.6.0 发布当天,**用户主动点"释放所有资源"按钮 + WebUI 继续刷新** 的场景几秒钟内就暴露了。
+
+**真实使用的意外行为,比审查员的想象力更丰富**。没有任何 CI 能模拟"用户点按钮的速度"。真机长跑 + 真实人类操作 = 最强 fuzz 测试。
+
+**如何检测这个 bug 之外的同类问题**: `grep -rn "\.tmp['\"]" bin/ daemon/ service.sh post-fs-data.sh` 找所有没 `$$` 的 tmp 文件,逐一检查是否可能并发。
+
+---
+
+### 坑 14: v3.6.0 webroot devIcon ReferenceError
+
+**事故版本**: v3.6.0 发布当天,v3.6.2 修复
+**文件**: `webroot/index.html` 的 `cardHTML()` 函数
+
+**症状**: 装机后 WebUI 完全空白。顶部统计显示"在线 1",下面一个设备卡片都没有。F12 console 一行红色 `ReferenceError: devIcon is not defined`。
+
+**根因**: v3.6.0 Commit 6 做了一次 webroot 精简,**删除了 `devIcon` 这个变量的声明**(原本基于 iface 给设备加前缀图标,后来觉得多余),但**忘记删除 `cardHTML()` 里对 `devIcon` 的引用**。
+
+```javascript
+// Commit 6 删掉了这行
+// var devIcon = (d.iface === 'wlan2') ? '📱' : '💻';
+
+// 但这行忘了删
+var cardHTML = '<div class="dev-card">' + devIcon + ' ' + name + ...;
+//                                         ^^^^^^^ ReferenceError
+```
+
+JavaScript 严格模式下,引用未声明变量直接抛 `ReferenceError`。cardHTML 抛错 → render loop 中断 → 整个 WebUI 空白。
+
+**为什么没被抓到**: HNC 的 JS 没有 linter,没有 TypeScript,没有 bundler。单元测试不覆盖 WebUI。Commit 6 的 diff 本身看起来"删得很干净" — 删的是变量声明,谁会想到还有个函数引用它?
+
+**修复(v3.6.2)**: 回退 Commit 6 的所有 webroot 改动,保留 devIcon 的声明。
+
+**元教训**: **删变量必须 grep 整个 repo**。任何删除变量 / 函数 / CSS 类 / API 的 commit,前置 checklist:
+
+```bash
+# 删之前必做
+grep -rn "devIcon" webroot/ bin/ api/ daemon/ test/
+# 如果有任何非自身的引用,删除前必须先改掉引用
+```
+
+这条规则同样适用于:
+- 删 Shell 函数前 `grep -rn "函数名" bin/ service.sh`
+- 删 C 函数前 `grep -n "函数名(" daemon/`
+- 删 JSON 字段前 grep 所有 JS + shell + C 代码
+- 删 CSS class 前 grep HTML + JS
+
+**元教训 2**: **CI 里至少跑一次 headless JS 加载检查**。哪怕只是 `node -e "require('jsdom').JSDOM.fromFile('webroot/index.html')"` 都能抓到 `ReferenceError`。HNC 没这个因为沙箱里没 headless 浏览器,但是值得在 v3.9 加。
+
+---
+
+### 坑 15: `dumpsys network_stack` 才是 Android 14+ DHCP 状态的真实来源
+
+**发现版本**: v3.7.0
+
+**背景**: HNC 长期想显示设备的真实 hostname(比如"Mi-10"、"DESKTOP-ABC123"),而不是 MAC 后 8 位兜底。之前尝试过:
+
+1. **dnsmasq.leases** — Android 原生用 netd/NetworkStack,**没有 dnsmasq**。只有 LineageOS 等少数 ROM 有,返回 `not found`。
+2. **logcat DhcpClient** — 正确位置,但 `logcat` 默认只保留几分钟,设备连了 1 小时后再看就没了,而且需要 `system_server` 权限才能读完整 logcat。
+3. **mDNS 反向查询** (by IP) — 成功率 30-40%,而且每次 800ms 阻塞。
+4. **被动嗅探 DHCPREQUEST** — 需要 raw socket + 复杂的包解析,overkill。
+
+**真实路径**(第 5 次尝试): `dumpsys network_stack`。Android 14+ 的 NetworkStack 是一个 **mainline module**(通过 Google Play System Update 独立更新),它把所有 DHCP 事件写到**内存 ring buffer**,dumpsys 能 dump 出来。每条格式:
+
+```
+2026-04-13T16:43:31 - [wlan2.DHCP] Transmitting DhcpAckPacket with lease
+  clientId: XXX, hwAddr: 7a:d6:f7:ce:ba:76, netAddr: 10.201.76.69/24,
+  expTime: 4968921,hostname: Mi-10
+```
+
+只要客户端发了 DHCP option 12,这里就有。35ms 拿到,零网络成本。
+
+**为什么之前没想到**: `dumpsys` 在我脑子里的默认印象是"看 service 状态" — 比如 `dumpsys activity` / `dumpsys battery`。没意识到 `network_stack` 里有完整的 ring buffer。第二个 AI 在咨询中指出这条路径。
+
+**元教训**: **Android 的数据源不在传统 Linux 路径里**。HNC 写了几年都在 `/proc/net/arp` 和 `dnsmasq` 里找数据,其实 Android 的核心网络栈数据全在 `netd` / `NetworkStack` / `system_server` 里,要通过 `dumpsys` / `cmd` / `binder` 查。下次找数据**先 `dumpsys list | grep <关键字>`**,再考虑 `/proc`。
+
+---
+
+### 坑 16: 同步路径和异步路径必须一起改 (v3.7.0 → v3.7.1)
+
+**事故版本**: v3.7.0 发布后真机立刻发现,v3.7.1 修复
+**文件**: `daemon/hotspotd.c:process_pending_mdns()`
+
+**症状**: v3.7.0 装机后,Mi-10 连进来,WebUI 显示 "Android" 60 秒,之后才变成 "Mi-10"。
+
+**根因**: v3.7.0 做了两件事:
+1. 给 `resolve_hostname()` 加了 DHCP 查询分支
+2. 让 `scan_arp` 的 re-resolve 路径(60 秒窗口触发)调用新版 `resolve_hostname`
+
+**但忘了**: `process_pending_mdns()` 是 v3.6 Commit 3 加的**异步 pending 处理路径**,它**直接调 `try_mdns_resolve()`**,绕过了 `resolve_hostname`。新设备首次连接时走 pending 路径,**只查 mDNS,不查 DHCP**。Mi-10 的 mDNS 返回 "Android"(OEM 通用名),pending 处理写入 `hostname_src="mdns"`,60 秒后 re-resolve 才走完整链拿到 "Mi-10"。
+
+```c
+// v3.7.0 的 process_pending_mdns (BUG)
+char new_hn[HN_LEN];
+if (try_mdns_resolve(oldest->ip, oldest->mac, new_hn, sizeof(new_hn))) {
+    // ← 绕过了 resolve_hostname 的 DHCP 查询
+    strncpy(oldest->hostname, new_hn, ...);
+    snprintf(oldest->hostname_src, ..., "mdns");
+}
+```
+
+**怎么发现的**: 我推理了 3 次都走偏(怀疑时序 / write_json / cache 污染),最后从真机日志 `pending→mac mdns failed` 和代码追踪才定位。**armchair debugging 浪费 30 分钟,真机数据 5 分钟定位**。
+
+**修复(v3.7.1)**: `process_pending_mdns` 改调 `resolve_hostname` 完整链。15 行改动。
+
+**元教训**: **任何函数加新逻辑,必须 grep 所有调用点确认都会走到新逻辑**。这个 bug 的根源是 v3.7.0 diff 审查时我只看了 "resolve_hostname 改动是否正确" 和 "scan_arp 调用点是否正确",**没审查 "还有谁调 try_mdns_resolve / 还有谁在绕过 resolve_hostname"**。
+
+v3.7.0 前应该做的检查:
+
+```bash
+# 1. 谁调 resolve_hostname?
+grep -n "resolve_hostname(" daemon/hotspotd.c
+# → scan_arp 的 re-resolve 分支 ✓
+# → nl_process 的 re-resolve 分支 ✓
+
+# 2. 谁直接调 try_mdns_resolve,绕过 resolve_hostname?
+grep -n "try_mdns_resolve(" daemon/hotspotd.c
+# → resolve_hostname 里 1 处(内部调用,OK)
+# → process_pending_mdns 里 1 处(← 这个是 BUG,但我没看)
+
+# 3. 谁写 hostname_src?
+grep -n '"mdns"' daemon/hotspotd.c
+# 同上
+```
+
+**一个更强的规则**: **不要有"重复实现同一个优先级链"的多个函数**。`process_pending_mdns` 里拷贝了 `resolve_hostname` 的简化版,注定会 drift。未来如果还需要"只查部分步骤"的变种,也要**共享同一个底层函数 + 参数化跳过步骤**,而不是复制粘贴。
+
+v3.7.2 的 `resolve_hostname_dhcp_only` 是复制了一部分,但至少结构跟 `resolve_hostname` 一一对应,容易同步。真正的修复在 v3.8 后期考虑 — 把 `resolve_hostname` 改成 `resolve_hostname(flags, ...)` 接收 `INCLUDE_MDNS` / `INCLUDE_DHCP` 等标志。
+
+---
+
+### 坑 17: MAC 白名单 off-by-one → RCE (v3.7.0 → v3.7.2)
+
+**事故版本**: v3.7.0 潜伏,Gemini 审查发现,v3.7.2 修复
+**文件**: `daemon/hotspotd.c:try_ns_dhcp_resolve()`
+
+**症状**: 代码审查时 Gemini 一眼看穿。本地沙箱 5 个 payload 测试验证可绕过。
+
+**代码**:
+
+```c
+int i;
+for (i = 0; mac[i] && i < 17; i++) {
+    char c = mac[i];
+    if (!((c >= '0' && c <= '9') || ... || c == ':')) {
+        return 0;
+    }
+}
+if (i != 17) return 0;  // ← 只检查循环跑了 17 次
+// 没有检查 mac[17] == '\0'
+```
+
+**攻击 payload**: `"11:22:33:44:55:66;reboot"`
+
+- 循环校验**前 17 个字符**(全合法) → `i` 递增到 17 → 循环条件 `i < 17` 为 false → 退出
+- `if (i != 17)` 通过
+- **`mac[17]` 是 `;` 从未被检查**
+- 随后这个字符串被 `snprintf(cmd, ..., "dumpsys ... | grep -iF %s ...", mac)` 拼进 shell 命令
+- shell 看到 `;`,执行 `reboot`
+- **RCE 在 root 权限下**
+
+**实际威胁评估**: 几乎不可触发。
+- MAC 地址来自 netlink ARP neigh 事件
+- 内核的 `struct nda_lladdr` 是定长 6 字节 binary
+- HNC 自己用 `snprintf("%02x:%02x:%02x:%02x:%02x:%02x", ...)` 格式化,永远是精确 17 字符
+- **不可能有外部攻击者构造畸形 MAC 送进来**
+
+**但这不是不修的理由**。修复成本 1 行,白名单校验 bug 就是 bug,**防御深度原则**不容妥协。
+
+**修复(v3.7.2)**: 
+
+```c
+if (i != 17 || mac[17] != '\0') return 0;
+```
+
+更彻底的修复是改用 `fork + execlp` 代替 `popen`,彻底抛弃 shell 参与。v3.7.2 一并做了(同时解决坑 18 和 19)。
+
+**元教训 A — "循环终止条件后必须显式检查 `[i] == '\\0'`"**:
+
+```c
+// ❌ 错:只检查循环跑了 N 次,没检查字符串恰好 N 字符
+for (i = 0; s[i] && i < N; i++) { ... }
+if (i != N) return 0;
+
+// ✅ 对:同时检查 N 字符 AND 第 N+1 个是 NUL
+for (i = 0; s[i] && i < N; i++) { ... }
+if (i != N || s[N] != '\0') return 0;
+
+// ✅ 或:先检查长度
+if (strnlen(s, N+1) != N) return 0;
+for (i = 0; i < N; i++) { ... validate ... }
+```
+
+**元教训 B — "whitelist 的 bug 就是 bug,不接受'实际不可触发'作为免修理由"**:
+
+安全代码的审查原则:
+1. **假设调用方是恶意的**,即使当前调用方不是
+2. **假设明天有人加新的调用方**,他不知道内部约定
+3. **假设这段代码被 copy 到别的项目**,那里的调用链不同
+
+HNC 的 `try_ns_dhcp_resolve` 现在只被 `resolve_hostname` 调,但明天如果有人加一个 IPC 命令 `GET_DHCP_NAME <mac>` 从 socket 读 MAC 直接传进来,原本的 RCE 就真的可触发。
+
+**元教训 C — "AI 审查是基础设施"**: 
+
+6 轮审查(Claude 自审 + 5 次外部 AI)有 5 次都漏掉了这个 bug。只有 Gemini 在明确要求"严格质疑所有输入校验"的情况下找到。这告诉我:
+- Claude 的自审存在盲点(特别是自己写的代码)
+- 代码 review 看 diff 的审查方式,天然会漏掉"调用关系"和"边界条件"
+- 外部 AI 审查必须**明确要求找特定类型的 bug**,才能跳出"礼貌同意"模式
+
+v3.7.2 之后 HNC 定下规则: **任何涉及 `popen/execlp/权限/内存/并发`的 P0 代码改动**必须经过外部 AI 审查才能发布。见"AI 审查流程"章节。
+
+---
+
+### 坑 18: popen 没超时 → system_server 卡死时主循环冻死
+
+**事故版本**: v3.7.0 潜伏,v3.7.2 修复
+**文件**: `daemon/hotspotd.c:try_ns_dhcp_resolve()` — 旧 popen 版本
+
+**背景**: v3.7.0 用 `popen("dumpsys network_stack 2>/dev/null | grep -iF %s", mac)` 查 DHCP hostname。正常情况 35ms 返回,很快。
+
+**潜伏 bug**: **`popen` 没有任何超时机制**。如果 `system_server` 卡死(ColorOS 后台杀手 / Doze 模式切换 / VPN 重连风暴 / kernel 资源紧张),`dumpsys` 是 binder 调用,会**无限期阻塞**等待 `system_server` 响应。
+
+- hotspotd 主循环被 `popen` 的 `fgets()` 卡住
+- netlink 事件队列积压
+- WebUI IPC 请求超时
+- watchdog 检测到 hotspotd 心跳异常
+- **watchdog 重启 hotspotd**
+- 重启后马上又被 `system_server` 卡住
+- 死循环雪崩
+
+**为什么没爆发**: 我的测试环境是 realme RMX5010 + SD8 Elite,system_server 卡死的频率低。如果是低端机或者负载高的机器,**一夜崩溃无限次**完全可能。
+
+**发现**: Gemini 审查直接指出"popen 是同步阻塞调用,需要带超时的替代方案"。
+
+**修复(v3.7.2)**: 完全重写 `try_ns_dhcp_resolve` 为 `fork + execlp + select(500ms 超时) + kill(SIGKILL) + waitpid`:
+
+```c
+pid_t pid = fork();
+if (pid == 0) {
+    dup2(pipefd[1], STDOUT_FILENO);
+    execlp("dumpsys", "dumpsys", "network_stack", NULL);
+    _exit(127);
+}
+
+// 父进程 select 超时 500ms
+fd_set rd; FD_SET(pipefd[0], &rd);
+struct timeval tv = {0, 500 * 1000};
+int ret = select(pipefd[0] + 1, &rd, NULL, NULL, &tv);
+if (ret == 0) {
+    kill(pid, SIGKILL);  // 超时击杀
+}
+waitpid(pid, NULL, 0);   // 收割
+```
+
+真机测试: 用 `sleep 5` 模拟卡死的 dumpsys,**501ms** 后被 SIGKILL 收割。
+
+**元教训 A — "任何外部命令都必须有硬超时"**:
+
+规则很简单,但容易忘:
+
+```c
+// ❌ 任何 popen / system / 阻塞 read 没超时都是 bug
+FILE *pf = popen(cmd, "r");
+while (fgets(...)) { ... }
+
+// ✅ 必须用 fork + select 或 timer
+```
+
+Shell 也一样:
+
+```sh
+# ❌
+result=$(dumpsys something)
+
+# ✅
+result=$(timeout 0.5 dumpsys something)
+```
+
+**元教训 B — "ColorOS 比原生 Android 脆弱 10 倍"**:
+
+ColorOS / MIUI / HarmonyOS 的后台管控逻辑非常激进:Doze 模式会冻结 system_server 的部分子系统,电源策略会延迟 binder 响应,VPN 重连风暴会耗尽 binder 线程池。**在 AOSP 上 35ms 返回的调用,在 ColorOS 上偶尔 5 秒,极端情况永远不返回**。
+
+开发 Android root 模块的经验值: 任何同步调用预期耗时乘以 30,作为超时下限。`dumpsys` 预期 35ms → 超时至少 1 秒。我在 v3.7.2 用了 500ms,因为 `select` 超时后 kill 是干净退出,**宁可偶尔 false-positive 杀掉正常调用也不能让主循环冻死**。
+
+---
+
+### 坑 19: pclose "总是执行"的假设很脆弱 → 僵尸进程
+
+**事故版本**: v3.7.0 潜伏,v3.7.2 修复
+**文件**: `daemon/hotspotd.c:try_ns_dhcp_resolve()` — 旧 popen 版本
+
+**代码模式**:
+
+```c
+FILE *pf = popen(cmd, "r");
+if (!pf) return 0;
+
+while (fgets(line, sizeof(line), pf) != NULL) {
+    // parse 逻辑
+    // ... 30 行代码 ...
+}
+
+int rc = pclose(pf);  // ← 依赖上面的所有分支都会走到这里
+```
+
+**问题**: 当前代码确实没有 early return,`pclose` 总是被调用。**但未来维护者加一个 `if (...) return 0;` 到循环里**,pclose 会被跳过,留下:
+- 僵尸进程(子进程退出后父进程没 wait,占用 process table slot)
+- 文件描述符泄漏(pf 对应的 pipe fd 没 close)
+
+**极端场景**: 高负载(大量 pending 设备)+ 某个 early return 被触发,一分钟产生 60 个僵尸,系统 `ps` 变慢,最终 fork 失败。
+
+**这种 bug 的可怕之处**: 代码审查看单次函数体觉得"OK 结构清晰",但系统性问题需要**分析所有控制流路径**才能发现。Gemini 审查指出了这个风险。
+
+**修复(v3.7.2)**: 改用 `fork + execlp` 后,waitpid 在所有退出路径(包括 SIGKILL 超时)之后**无条件执行**:
+
+```c
+waitpid(pid, &status, 0);  // 函数退出前最后一步,所有路径都会到
+```
+
+**元教训 — "资源清理不要靠控制流自然走到"**:
+
+C 语言几个强制资源清理模式,按推荐度排序:
+
+1. **集中 cleanup + goto**: 
+
+```c
+int func(void) {
+    FILE *pf = popen(...);
+    char *buf = malloc(...);
+    int result = 0;
+
+    if (!buf) { result = -1; goto cleanup; }
+    if (error_cond_1) { result = -2; goto cleanup; }
+    // ... main logic ...
+    result = parse_result;
+
+cleanup:
+    if (pf) pclose(pf);
+    if (buf) free(buf);
+    return result;
+}
+```
+
+2. **RAII 宏**(GCC `__attribute__((cleanup))`):
+
+```c
+static inline void _close_pf(FILE **pp) { if (*pp) pclose(*pp); }
+#define CLEANUP_PCLOSE __attribute__((cleanup(_close_pf)))
+
+int func(void) {
+    CLEANUP_PCLOSE FILE *pf = popen(...);
+    // pf 自动 pclose,即使 early return
+}
+```
+
+3. **fork + waitpid** (v3.7.2 的选择): 控制流集中在父进程底部 waitpid,子进程独立地址空间无泄漏。**功能比 popen 强(可以超时 + SIGKILL),资源管理比 popen 简单**。
+
+**绝对禁止**: 让 pclose / close / free 分散在函数体中间的 if-else 里,依赖"正常控制流"走到。
+
+---
+
+### 坑 20: 同步调用链需要端到端测试,不是函数单测
+
+**教训版本**: v3.7.0 发布前检查漏洞,v3.7.1 事故,v3.8 才补上对策
+
+**背景**: 坑 16 (v3.7.0 → v3.7.1) 的根本问题是:
+- `resolve_hostname()` 的单测覆盖了所有分支(manual/dhcp/mdns/mac 优先级)
+- `process_pending_mdns()` 的 pending 逻辑单测覆盖了 FIFO 选择
+- **但没有一个测试验证"pending 路径最终会走到 resolve_hostname"**
+
+两个函数**单独**测都是绿的,合起来**坏**。这是典型的**单元测试覆盖不到集成问题**。
+
+**应对**: 需要 **调用链级端到端测试**。HNC v3.8.2(阶段 3)计划引入轻量 mock framework,让以下形式的测试可写:
+
+```c
+// 伪代码,v3.8.2 目标
+void test_pending_path_reaches_dhcp(void) {
+    // mock try_ns_dhcp_resolve 返回 "Mi-10"
+    mock_set(try_ns_dhcp_resolve, "Mi-10");
+    
+    // setup pending device
+    Device d = {.hostname_src = "pending", .pending_since = 0, ...};
+    g_devs[0] = d;
+    
+    // 驱动 pending 处理
+    process_pending_mdns();
+    
+    // 验证 pending 路径确实走到了 dhcp
+    assert_str_eq(g_devs[0].hostname, "Mi-10");
+    assert_str_eq(g_devs[0].hostname_src, "dhcp");
+}
+```
+
+如果 v3.7.0 前有这个测试,**process_pending_mdns 绕过 resolve_hostname 的问题会在编译时被抓住**(测试 fail)。
+
+**元教训**: **任何跨函数的关键逻辑都需要"组装测试",而不是只测组件**。HNC 的测试策略 v3.8 之后要从"单元覆盖"升级为"调用链覆盖"。
+
+---
+
+## 🛡️ AI 审查流程(v3.7.2 之后的标准步骤)
+
+HNC 项目每次 **P0 级改动** 发布前**必须**经过外部 AI 审查。
+
+**什么是 P0 级改动**:
+
+- 涉及 `popen` / `execlp` / `system` 等外部命令
+- 涉及 `fork` / `pthread` / `signal` 等并发原语
+- 涉及权限变更(`chmod` / `setuid` / `capabilities`)
+- 涉及内存操作(指针、动态分配、缓冲区)
+- 涉及安全边界(IPC 输入、shell 拼接、SQL/JSON 构造)
+- 涉及并发数据结构(共享全局状态、锁、无锁数据结构)
+- 任何会导致"真机一出问题整个 HNC 不可用"的改动
+
+**审查流程**:
+
+1. **本地跑全套测试**(Shell 64 + C hostname_helpers 50 + C mdns_parse 11 + 相关新增)
+2. **Claude 自审** — 但不接受"我觉得没问题"作为充分理由
+3. **生成审查文档** `HNC_vX.Y.Z_audit_prompt.md`,含:
+   - 完整代码 diff(所有改动)
+   - 调用关系上下文(被谁调,调谁)
+   - 设计目标和取舍
+   - 20+ 个明确的审查问题,按 P0/P1/P2/P3 分级
+   - 末尾"额外发现"区,鼓励找没列出的问题
+4. **发给外部 AI**(Gemini / GPT / 独立 Claude 实例),要求**严格质疑,不要礼貌**
+5. **处理反馈**:
+   - P0 必修(不修不发)
+   - P1 评估(当次修 or 明确延后到哪个版本)
+   - P2/P3 归档到 ROADMAP.md 或 HACKING.md
+6. **CI 编译 + arm64 binary artifact**
+7. **真机装机验证**(`diag.sh` + 核心场景手动测试)
+8. **至少观察 30 分钟**真机运行(v3.7.0 的 bug 20 分钟暴露)
+
+**已验证有效**:
+
+| 审查事件 | 发现 | 影响 |
+|---|---|---|
+| v3.6.3 前 Gemini 审查 | REFRESH DoS (P1) + socket 0666 权限 (P1) | 避免了 DoS 攻击面 + 本地信息泄漏 |
+| v3.7.0 设计阶段咨询 | 指出 `dumpsys network_stack` 路径 | 让核心功能能工作 |
+| v3.7.2 前 Gemini 审查 | **真 RCE (P0) + popen 阻塞 (P0) + 僵尸进程 (P1) + grep 精度 (P2)** | 修复了 5 个潜在线上事故 |
+
+**外部 AI 审查不是"可选优化",是"发布基础设施"**。
+
+**什么情况可以跳过**: 只有以下改动可以跳过外部审查:
+- 纯文档更新(README / HACKING / CHANGELOG)
+- 纯测试代码新增(不改产品代码)
+- Shell 脚本里的字符串改动(不改控制流)
+- WebUI 的纯 CSS / 文案改动
+
+**其他所有改动默认需要审查**。
+
+---
+
 ## 🧪 测试策略
 
 ### 测试架构

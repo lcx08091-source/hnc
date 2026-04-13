@@ -524,7 +524,14 @@ static void resolve_hostname(const char *mac, const char *ip,
         return;
     }
 
-    /* 4. MAC 兜底 */
+    /* 4. v3.8.0: OUI 厂商表兜底(Apple/Xiaomi/Huawei/... 444 条)
+     * 随机 MAC (LAA bit=1) 会被 hnc_lookup_oui 自动跳过 */
+    if (hnc_lookup_oui(mac, out_hn, hn_len)) {
+        snprintf(out_src, src_len, "oui");
+        return;
+    }
+
+    /* 5. MAC 兜底(最后的 fallback) */
     hnc_mac_fallback(mac, out_hn, hn_len);
     snprintf(out_src, src_len, "mac");
 }
@@ -576,7 +583,13 @@ static void resolve_hostname_dhcp_only(const char *mac,
         return;
     }
 
-    /* 3. MAC 兜底(不走 mDNS,避免主循环阻塞 800ms) */
+    /* 3. v3.8.0: OUI 厂商表兜底 */
+    if (hnc_lookup_oui(mac, out_hn, hn_len)) {
+        snprintf(out_src, src_len, "oui");
+        return;
+    }
+
+    /* 4. MAC 兜底(不走 mDNS,避免主循环阻塞 800ms) */
     hnc_mac_fallback(mac, out_hn, hn_len);
     snprintf(out_src, src_len, "mac");
 }

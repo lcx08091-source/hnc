@@ -1,7 +1,7 @@
 id=hotspot_network_control
 name=Hotspot Network Control
-version=v3.7.2
-versionCode=3702
+version=v3.8.0
+versionCode=3800
 author=Claude (Anthropic AI)
-description=热点设备管控 v3.7.2 · Gemini 深度安全审查后紧急修复:1) RCE 漏洞 — try_ns_dhcp_resolve 的 MAC 白名单校验存在越界逃逸,攻击者构造含 '; reboot' 的字符串可绕过校验导致命令注入。虽然 MAC 来自 netlink 内核事件不可触发,但防御深度必须修复。2) popen 无超时 — dumpsys 调用可能因 system_server 卡死而无限阻塞主线程,触发 watchdog 误重启。3) 僵尸进程风险 — pclose 依赖所有路径都被执行。4) pending 路径 mDNS regression — v3.7.1 让 pending 路径走完整 resolve_hostname 链,mDNS 的 800ms 阻塞回归。一次性重构 try_ns_dhcp_resolve 为 fork+execlp+select+waitpid 同时修复 1/2/3,新增 resolve_hostname_dhcp_only 给 pending 路径专用修复 4。135 单元测试全过 + 20 个 MAC RCE 专项测试 + 9 个功能测试。
+description=热点设备管控 v3.8.0 · 阶段 1/6 (大 v3.8 首个里程碑) · 新增 OUI 厂商查表兜底(Apple/Xiaomi/Huawei/Google/OPPO/vivo/Samsung/Dell/HP/Lenovo/Microsoft/Intel/Sony/Nintendo/Amazon/Raspberry-Pi/Espressif 等 444 条前缀),让 Pixel/原生 Android 等不发 DHCP option 12 的设备从 MAC 后 8 位(如 D69D0FA1)显示升级为 "Google 设备" / "Apple 设备"。自动跳过随机 MAC (locally-administered bit)。新增 dumpsys network_stack 格式探针到 diag.sh,Android 版本升级后格式变化会被立即检测。HACKING.md 归档了今天 7 次迭代的 6 条经典坑教训。21 个 OUI 单元测试 + 164 历史回归全过。
 minKernelSU=11485

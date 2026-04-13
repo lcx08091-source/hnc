@@ -1430,10 +1430,35 @@ html,body { min-height:100%; background:var(--bg); color:var(--t0); font-family:
         <div class="about-name">HNC · Hotspot Network Control</div>
         <div class="about-author">作者：Claude (Anthropic AI) &nbsp;·&nbsp; KSU / Magisk 模块</div>
       </div>
-      <span class="about-ver">v3.7.2</span>
+      <span class="about-ver">v3.8.0</span>
     </div>
     <!-- 更新日志 -->
     <div class="changelog">
+
+      <!-- v3.8.0 大 v3.8 阶段 1:OUI 厂商兜底 + 格式探针（默认展开）-->
+      <div class="cl-item">
+        <div class="cl-left">
+          <div class="cl-dot"></div>
+          <div class="cl-line"></div>
+        </div>
+        <div class="cl-right">
+          <div class="cl-title">🏷️ v3.8.0 OUI 厂商兜底 + dumpsys 格式探针 &nbsp;<span style="font-size:11px;color:var(--t2);font-weight:400">2026-04-14</span></div>
+          <div class="cl-tags">
+            <span class="cl-tag feat" style="background:#059669;color:#fff">OUI 444 条</span>
+            <span class="cl-tag feat">格式探针</span>
+            <span class="cl-tag feat">教训归档</span>
+          </div>
+          <ul class="cl-changes">
+            <li><b>🏷️ A1 OUI 厂商查表兜底</b>:DHCP/mDNS 全都没命中时,查 MAC 前 3 字节的厂商前缀表,把 "D69D0FA1" 显示升级为 "Apple 设备" / "Xiaomi 设备" / "Google 设备"。覆盖 Apple/小米/华为/OPPO/vivo/三星/Dell/HP/联想/微软/谷歌/Intel/索尼/任天堂/亚马逊/树莓派/乐鑫/飞利浦/TP-Link 等 <b>444 条 OUI 前缀</b>,覆盖中国大陆 90%+ 常见终端</li>
+            <li><b>🎯 特别优化</b>:自动检测 locally-administered bit (MAC 首字节 bit 1),随机 MAC(Android 10+ 默认开启的 MAC 隐私随机化)直接跳过,不会返回伪造的"厂商",降级为 MAC 兜底</li>
+            <li><b>🎨 WebUI 新图标</b>:<code>hostname_src === 'oui'</code> 的设备显示 🏷️ 图标(非精确识别),点击可手动命名</li>
+            <li><b>🔍 B2 dumpsys 格式探针</b>:<code>diag.sh</code> 新增 [14/14] 检查项,启动时验证 <code>dumpsys network_stack</code> 输出同时包含 "hwAddr: " 和 "hostname: " 双锚点。未来 Android 版本升级 Google 改格式时,HNC 会在启动时立刻暴露问题,而不是等用户抱怨"为什么 WebUI 所有设备都变成 MAC 兜底了"</li>
+            <li><b>📖 D1 HACKING.md 教训归档</b>:新增 7 条"经典坑"(14-20 号):webroot devIcon ReferenceError / dumpsys network_stack 才是 Android 14+ DHCP 真实来源 / 同步路径和异步路径必须一起改 / MAC 白名单 off-by-one RCE / popen 没超时 / pclose 假设脆弱 / 调用链端到端测试需求。同时新增"AI 审查流程"章节,把今天 4 次外部 AI 审查的经验固化为发布前置条件</li>
+            <li><b>🧪 测试</b>:21 个 OUI 单元测试(Apple/Xiaomi/Huawei/OPPO/Samsung/Google/Raspberry Pi 命中 + LAA bit 跳过 + 非法输入 + 边界) + 146 历史测试全过</li>
+            <li><b>🗺️ 阶段路线</b>:这是大 v3.8 的<b>第 1 个阶段</b>(共 5-6 个阶段)。后续计划 v3.8.1 DHCP hostname 持久化 cache,v3.8.2 跨函数调用链测试框架(坑 20 的对策),v3.8.3 mDNS 服务发现改造,v3.8.4 pthread mDNS 异步化。按阶段发布降低风险</li>
+          </ul>
+        </div>
+      </div>
 
       <!-- v3.7.2 Gemini 安全审查修复（默认展开）-->
       <div class="cl-item">
@@ -2622,6 +2647,7 @@ function cardHTML(d, isExp, idx) {
   if (nameSrc === 'manual')  srcIcon = '<span class="name-src-icon manual" onclick="event.stopPropagation();window.editName(\''+emAttr+'\',\''+nmAttr+'\')" title="手动命名,点击修改">\u270F\uFE0F</span>';
   else if (nameSrc === 'mdns') srcIcon = '<span class="name-src-icon" onclick="event.stopPropagation();window.editName(\''+emAttr+'\',\''+nmAttr+'\')" title="mDNS 自动识别,点击修改">\uD83D\uDD0D</span>';
   else if (nameSrc === 'dhcp') srcIcon = '<span class="name-src-icon" onclick="event.stopPropagation();window.editName(\''+emAttr+'\',\''+nmAttr+'\')" title="DHCP 客户端汇报,点击修改">\uD83D\uDCE1</span>';
+  else if (nameSrc === 'oui')  srcIcon = '<span class="name-src-icon" onclick="event.stopPropagation();window.editName(\''+emAttr+'\',\''+nmAttr+'\')" title="OUI 厂商识别(非精确),点击命名">\uD83C\uDFF7\uFE0F</span>';
   else /* mac fallback / pending */ srcIcon = '<span class="name-src-icon mac" onclick="event.stopPropagation();window.editName(\''+emAttr+'\',\'\')" title="未识别,点击命名">\u270F\uFE0F</span>';
 
   /* v3.4.6: 速率颜色 class */
@@ -3433,6 +3459,7 @@ function updateCardFields(card, d) {
     if (nameSrc === 'manual')      newSrcHTML = '<span class="name-src-icon manual" onclick="event.stopPropagation();window.editName(\''+emAttr+'\',\''+nmAttr+'\')" title="手动命名,点击修改">\u270F\uFE0F</span>';
     else if (nameSrc === 'mdns')   newSrcHTML = '<span class="name-src-icon" onclick="event.stopPropagation();window.editName(\''+emAttr+'\',\''+nmAttr+'\')" title="mDNS 自动识别,点击修改">\uD83D\uDD0D</span>';
     else if (nameSrc === 'dhcp')   newSrcHTML = '<span class="name-src-icon" onclick="event.stopPropagation();window.editName(\''+emAttr+'\',\''+nmAttr+'\')" title="DHCP 客户端汇报,点击修改">\uD83D\uDCE1</span>';
+    else if (nameSrc === 'oui')    newSrcHTML = '<span class="name-src-icon" onclick="event.stopPropagation();window.editName(\''+emAttr+'\',\''+nmAttr+'\')" title="OUI 厂商识别(非精确),点击命名">\uD83C\uDFF7\uFE0F</span>';
     /* v3.6.2: 回退 pending 分支(装机后 WebUI 空白),当作 mac 降级显示 */
     else /* mac / pending */       newSrcHTML = '<span class="name-src-icon mac" onclick="event.stopPropagation();window.editName(\''+emAttr+'\',\'\')" title="未识别,点击命名">\u270F\uFE0F</span>';
     if (srcWrap.innerHTML !== newSrcHTML) srcWrap.innerHTML = newSrcHTML;

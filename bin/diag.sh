@@ -1,8 +1,8 @@
 #!/system/bin/sh
 
-# v3.7.2 alpha-0: PATH 健壮性,见 service.sh
+# v3.8.0 alpha-0: PATH 健壮性,见 service.sh
 [ -z "$HNC_SKIP_PATH_HARDENING" ] && [ -z "$HNC_TEST_MODE" ] && export PATH=/system/bin:/system/xbin:/vendor/bin:$PATH
-# diag.sh — HNC v3.7.2 自检脚本
+# diag.sh — HNC v3.8.0 自检脚本
 #
 # 用法:
 #   sh /data/local/hnc/bin/diag.sh
@@ -35,11 +35,11 @@ fail() { FAIL=$((FAIL+1)); RESULTS="$RESULTS$1|FAIL|$2
 
 [ $JSON_MODE -eq 0 ] && {
     echo ""
-    echo "  HNC v3.7.2 自检"
+    echo "  HNC v3.8.0 自检"
     echo "  ──────────────────────────────────────────────"
 }
 
-# ── [1/12] HNC 安装目录 ──────────────────────────────────
+# ── [1/14] HNC 安装目录 ──────────────────────────────────
 if [ -d "$HNC" ]; then
     if [ -d "$HNC/bin" ] && [ -d "$HNC/data" ] && [ -f "$HNC/module.prop" ]; then
         VER=$(grep "^version=" "$HNC/module.prop" | cut -d= -f2)
@@ -51,7 +51,7 @@ else
     fail "安装目录" "$HNC 不存在"
 fi
 
-# ── [2/12] 关键脚本 ──────────────────────────────────────
+# ── [2/14] 关键脚本 ──────────────────────────────────────
 MISSING=""
 for f in device_detect.sh iptables_manager.sh tc_manager.sh json_set.sh watchdog.sh; do
     [ -f "$HNC/bin/$f" ] || MISSING="$MISSING $f"
@@ -62,7 +62,7 @@ else
     fail "shell 脚本" "缺失:$MISSING"
 fi
 
-# ── [3/12] mdns_resolve 二进制 ──────────────────────────
+# ── [3/14] mdns_resolve 二进制 ──────────────────────────
 if [ -x "$HNC/bin/mdns_resolve" ]; then
     SIZE=$(stat -c %s "$HNC/bin/mdns_resolve" 2>/dev/null || echo 0)
     if [ "$SIZE" -gt 100000 ]; then
@@ -74,7 +74,7 @@ else
     warn "mDNS 工具" "未安装,自动命名功能不可用"
 fi
 
-# ── [4/12] iptables 链 ──────────────────────────────────
+# ── [4/14] iptables 链 ──────────────────────────────────
 HAS_MARK=0; HAS_LIMIT_DOWN=0; HAS_LIMIT_UP=0; HAS_STATS=0
 iptables -t mangle -L HNC_MARK -n >/dev/null 2>&1 && HAS_MARK=1
 iptables -t mangle -L HNC_LIMIT_DOWN -n >/dev/null 2>&1 && HAS_LIMIT_DOWN=1
@@ -89,7 +89,7 @@ else
     fail "iptables 链" "0/4 — HNC 后端未运行"
 fi
 
-# ── [5/12] tc qdisc ─────────────────────────────────────
+# ── [5/14] tc qdisc ─────────────────────────────────────
 IFACE=$(sh "$HNC/bin/device_detect.sh" iface 2>/dev/null)
 if [ -n "$IFACE" ]; then
     if tc qdisc show dev "$IFACE" 2>/dev/null | grep -q "htb"; then
@@ -101,7 +101,7 @@ else
     warn "tc qdisc" "无法识别热点 iface"
 fi
 
-# ── [6/12] watchdog 进程 ────────────────────────────────
+# ── [6/14] watchdog 进程 ────────────────────────────────
 WD_COUNT=$(pgrep -f "watchdog.sh" 2>/dev/null | wc -l)
 if [ "$WD_COUNT" -gt 0 ]; then
     WD_PID=$(pgrep -f "watchdog.sh" 2>/dev/null | head -1)
@@ -110,7 +110,7 @@ else
     warn "watchdog" "未运行(可能未启用自启)"
 fi
 
-# ── [7/12] 数据文件 ──────────────────────────────────────
+# ── [7/14] 数据文件 ──────────────────────────────────────
 RULES_COUNT=0
 DEV_COUNT=0
 NAMES_COUNT=0
@@ -119,7 +119,7 @@ NAMES_COUNT=0
 [ -f "$HNC/data/device_names.json" ] && NAMES_COUNT=$(grep -oE '"[0-9a-f:]{17}":' "$HNC/data/device_names.json" 2>/dev/null | wc -l)
 ok "数据文件" "rules=$RULES_COUNT 设备 / devices=$DEV_COUNT 在线 / names=$NAMES_COUNT 命名"
 
-# ── [8/12] hostname 缓存 ────────────────────────────────
+# ── [8/14] hostname 缓存 ────────────────────────────────
 if [ -f "$HNC/run/hostname_cache" ]; then
     CACHE_LINES=$(wc -l < "$HNC/run/hostname_cache" 2>/dev/null || echo 0)
     ok "hostname 缓存" "$CACHE_LINES 条记录"
@@ -127,7 +127,7 @@ else
     warn "hostname 缓存" "未生成(扫描尚未运行?)"
 fi
 
-# ── [9/12] 数据备份(v3.4.9 新增) ────────────────────────
+# ── [9/14] 数据备份(v3.4.9 新增) ────────────────────────
 BACKUP_COUNT=$(ls -d "$HNC/data/.backup-"* 2>/dev/null | wc -l)
 if [ "$BACKUP_COUNT" -gt 0 ]; then
     LATEST=$(ls -dt "$HNC/data/.backup-"* 2>/dev/null | head -1 | sed "s|.*\.backup-||")
@@ -136,7 +136,7 @@ else
     warn "数据备份" "尚无备份(等下次开机自动创建)"
 fi
 
-# ── [10/12] 日志目录 ────────────────────────────────────
+# ── [10/14] 日志目录 ────────────────────────────────────
 if [ -d "$HNC/logs" ]; then
     LOG_SIZE=$(du -sk "$HNC/logs" 2>/dev/null | awk '{print $1}')
     LOG_FILES=$(ls "$HNC/logs" 2>/dev/null | wc -l)
@@ -149,7 +149,7 @@ else
     warn "日志目录" "$HNC/logs 不存在"
 fi
 
-# ── [11/12] KSU 环境 ────────────────────────────────────
+# ── [11/14] KSU 环境 ────────────────────────────────────
 if [ -x /data/adb/ksu/bin/ksud ]; then
     KSU_VER=$(/data/adb/ksu/bin/ksud --version 2>/dev/null | head -1)
     ok "KSU 环境" "${KSU_VER:-detected}"
@@ -159,7 +159,7 @@ else
     warn "KSU 环境" "未检测到 ksud (可能 Magisk 环境)"
 fi
 
-# ── [12/13] SELinux 模式 ─────────────────────────────────
+# ── [12/14] SELinux 模式 ─────────────────────────────────
 SE_MODE=$(getenforce 2>/dev/null)
 if [ "$SE_MODE" = "Enforcing" ]; then
     ok "SELinux" "Enforcing (正常)"
@@ -169,7 +169,7 @@ else
     warn "SELinux" "无法读取状态"
 fi
 
-# ── [13/13] hotspotd 防误用检查(v3.4.11) ────────────────
+# ── [13/14] hotspotd 防误用检查(v3.4.11) ────────────────
 # hotspotd 是 v3.5+ 实验功能,LTS 期不应启用。
 # 如果 bin/hotspotd 二进制存在,WARN 提醒可能撞 P0-4/P1-2/P1-7/P1-8。
 if [ -e "$HNC/bin/hotspotd" ]; then
@@ -178,10 +178,44 @@ else
     ok "hotspotd 防误用" "未编译(LTS 默认状态)"
 fi
 
+# ── [14/14] dumpsys network_stack 格式探针(v3.8.0) ───────
+# v3.7.0 加入的 DHCP hostname 识别功能,依赖 `dumpsys network_stack` 输出里
+# 同时包含 "hwAddr: " 和 "hostname: " 两个字段。Android mainline 模块没有
+# 稳定的 API 合约,将来 Google 改了输出格式 HNC 会静默失效(WebUI 所有
+# 设备都变成 MAC 兜底或 OUI 兜底)。
+#
+# Gemini P1-6 审查指出的问题。这个探针让格式变化**在启动时立刻暴露**,
+# 不是等到某个用户抱怨"为什么所有设备都变名字了"才发现。
+#
+# 检查策略:
+#   1. 能跑 dumpsys network_stack 且有输出(root 权限正常)
+#   2. 输出至少包含一次 "hwAddr: "
+#   3. 输出至少包含一次 "hostname: "
+#
+# 三个都 OK → 格式匹配 v3.7+ 预期
+# 有输出但缺 hwAddr/hostname → 格式已变,WARN + 建议升级
+# 无输出 / 命令失败 → WARN(可能 root 受限 / Android < 14)
+NS_OUT=$(dumpsys network_stack 2>/dev/null | head -200)
+if [ -z "$NS_OUT" ]; then
+    warn "dumpsys 格式探针" "dumpsys network_stack 无输出(Android < 14 或 root 受限),DHCP hostname 识别将降级"
+else
+    HAS_HWADDR=$(printf '%s' "$NS_OUT" | grep -c "hwAddr: ")
+    HAS_HOSTNAME=$(printf '%s' "$NS_OUT" | grep -c "hostname: ")
+    if [ "$HAS_HWADDR" -gt 0 ] && [ "$HAS_HOSTNAME" -gt 0 ]; then
+        ok "dumpsys 格式探针" "hwAddr + hostname 锚点齐全(DHCP 识别功能可用)"
+    elif [ "$HAS_HWADDR" -gt 0 ]; then
+        warn "dumpsys 格式探针" "有 hwAddr 但无 hostname 字段,可能 ring buffer 暂时无 DHCP 事件,或格式已变"
+    elif [ "$HAS_HOSTNAME" -gt 0 ]; then
+        warn "dumpsys 格式探针" "有 hostname 但无 hwAddr 字段,格式异常,建议升级 HNC"
+    else
+        warn "dumpsys 格式探针" "输出存在但无 hwAddr/hostname 字段,Android 版本格式已变,HNC 需要更新"
+    fi
+fi
+
 # ── 汇总输出 ────────────────────────────────────────────
 if [ $JSON_MODE -eq 1 ]; then
     # JSON 输出
-    printf '{"version":"v3.7.2","pass":%d,"warn":%d,"fail":%d,"checks":[' "$PASS" "$WARN" "$FAIL"
+    printf '{"version":"v3.8.0","pass":%d,"warn":%d,"fail":%d,"checks":[' "$PASS" "$WARN" "$FAIL"
     FIRST=1
     echo "$RESULTS" | while IFS='|' read -r name status detail; do
         [ -z "$name" ] && continue
