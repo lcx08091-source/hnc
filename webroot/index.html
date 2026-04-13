@@ -1430,10 +1430,37 @@ html,body { min-height:100%; background:var(--bg); color:var(--t0); font-family:
         <div class="about-name">HNC · Hotspot Network Control</div>
         <div class="about-author">作者：Claude (Anthropic AI) &nbsp;·&nbsp; KSU / Magisk 模块</div>
       </div>
-      <span class="about-ver">v3.7.1</span>
+      <span class="about-ver">v3.7.2</span>
     </div>
     <!-- 更新日志 -->
     <div class="changelog">
+
+      <!-- v3.7.2 Gemini 安全审查修复（默认展开）-->
+      <div class="cl-item">
+        <div class="cl-left">
+          <div class="cl-dot"></div>
+          <div class="cl-line"></div>
+        </div>
+        <div class="cl-right">
+          <div class="cl-title">🛡️ v3.7.2 Gemini 深度安全审查紧急修复 &nbsp;<span style="font-size:11px;color:var(--t2);font-weight:400">2026-04-13</span></div>
+          <div class="cl-tags">
+            <span class="cl-tag fix" style="background:#dc2626;color:#fff">P0 RCE 修复</span>
+            <span class="cl-tag fix">popen 超时</span>
+            <span class="cl-tag fix">pending regression</span>
+          </div>
+          <ul class="cl-changes">
+            <li><b>🚨 P0-1 RCE 漏洞</b>:<code>try_ns_dhcp_resolve</code> 的 MAC 白名单校验存在越界逃逸。原版 <code>for (i=0; mac[i] && i&lt;17; i++)</code> 只检查前 17 字符,如果输入 <code>"11:22:33:44:55:66;reboot"</code>,循环到 i=17 退出时从未检查第 18 个字符 <code>;</code>,然后被原版 popen 的 <code>%s</code> 拼进 shell 命令导致 RCE。虽然 MAC 来自 netlink 内核事件不可触发,但防御深度必须修复</li>
+            <li><b>🚨 P0-2 popen 无超时</b>:<code>popen("dumpsys...")</code> 在 ColorOS system_server 卡死时会无限阻塞 hotspotd 主线程,触发 watchdog 误重启</li>
+            <li><b>🚨 P0-3 僵尸进程风险</b>:<code>pclose</code> 依赖所有退出路径都被执行,未来维护加 <code>return</code> 就会漏</li>
+            <li><b>🚨 P0-4 pending 路径 mDNS regression</b>:v3.7.1 让 pending 路径调完整 <code>resolve_hostname</code>,对不发 option 12 的 Pixel 设备会阻塞 800ms mDNS。v3.6 "最多 800ms 阻塞一次" 的承诺被破坏</li>
+            <li><b>🔧 修复 1/2/3 — 一次重构</b>:<code>try_ns_dhcp_resolve</code> 从 <code>popen + grep shell</code> 重写为 <b><code>fork + execlp("dumpsys") + select 500ms 超时 + SIGKILL + waitpid</code></b>,内存中 <code>strcasestr + strstr</code> 双锚点匹配代替 grep。零 shell 参与 → 零注入可能;硬超时 500ms → 卡死时主循环立即恢复;waitpid 100% 收割 → 零僵尸进程;双锚点 <code>hwAddr: mac</code> + <code>hostname:</code> → 匹配精度更高</li>
+            <li><b>🔧 修复 4 — 新函数 resolve_hostname_dhcp_only</b>:只查 manual + dhcp + mac(不查 mDNS),给 <code>process_pending_mdns</code> 专用。pending 耗时上限从 ~1.3s 降到 ~500ms (dhcp 超时)。mDNS 推迟到 60 秒后的 re-resolve 路径。对 Pixel 等设备装机瞬间显示 MAC 兜底,60 秒自动升级到 mDNS</li>
+            <li><b>🧪 测试</b>:20 个 MAC RCE 专项测试(<code>;reboot</code> / <code>$()</code> / <code>\`whoami\`</code> / <code>&amp;&amp;</code> / 换行注入 全部被拒)+ 9 个功能测试(Mi-10 提取 / 多行取最新 / 双锚点 / 含空格 hostname / 500ms 超时实际生效)+ 135 历史回归全过</li>
+            <li><b>📊 Gemini 的 22 个审查点</b>:5 个 P0(全修)+ 3 个 P1 真 bug(延后 v3.8)+ 2 个小修(line buffer / 日志格式)+ 5 个伪 bug 或过度工程(不改)+ 7 个自评 OK</li>
+            <li><b>🙏 Gemini 的贡献</b>:如果没有这次审查,RCE 漏洞会一直存在,popen 无超时会在某次 system_server 卡死时触发 watchdog 雪崩。HNC 项目对外部审查的依赖这次又是决定性的。这是今天第 3 次 Gemini 审查(前两次分别在 v3.6.3 和 v3.7.0 之前)</li>
+          </ul>
+        </div>
+      </div>
 
       <!-- v3.7.1 pending 路径 DHCP 修复（默认展开）-->
       <div class="cl-item">

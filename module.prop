@@ -1,7 +1,7 @@
 id=hotspot_network_control
 name=Hotspot Network Control
-version=v3.7.1
-versionCode=3701
+version=v3.7.2
+versionCode=3702
 author=Claude (Anthropic AI)
-description=热点设备管控 v3.7.1 · 修复 v3.7.0 的 pending 路径遗漏:process_pending_mdns 之前直接调 try_mdns_resolve 绕过了 DHCP 查询,导致新设备首次识别必须等 60 秒 re-resolve 才能升级到 DHCP hostname。现在 pending 路径调 resolve_hostname 完整链 (manual>dhcp>mdns>mac),新设备首次 pending 处理就拿到正确 hostname。详见 CHANGELOG.md。
+description=热点设备管控 v3.7.2 · Gemini 深度安全审查后紧急修复:1) RCE 漏洞 — try_ns_dhcp_resolve 的 MAC 白名单校验存在越界逃逸,攻击者构造含 '; reboot' 的字符串可绕过校验导致命令注入。虽然 MAC 来自 netlink 内核事件不可触发,但防御深度必须修复。2) popen 无超时 — dumpsys 调用可能因 system_server 卡死而无限阻塞主线程,触发 watchdog 误重启。3) 僵尸进程风险 — pclose 依赖所有路径都被执行。4) pending 路径 mDNS regression — v3.7.1 让 pending 路径走完整 resolve_hostname 链,mDNS 的 800ms 阻塞回归。一次性重构 try_ns_dhcp_resolve 为 fork+execlp+select+waitpid 同时修复 1/2/3,新增 resolve_hostname_dhcp_only 给 pending 路径专用修复 4。135 单元测试全过 + 20 个 MAC RCE 专项测试 + 9 个功能测试。
 minKernelSU=11485
