@@ -1,7 +1,7 @@
 id=hotspot_network_control
 name=Hotspot Network Control
-version=v3.6.3
-versionCode=3603
+version=v3.7.0
+versionCode=3700
 author=Claude (Anthropic AI)
-description=热点设备管控 v3.6.3 · Gemini 第四轮审查发现的 2 个 P1 修复:(1) REFRESH 缓存击穿 DoS → 加 2s 最小重算间隔 (2) unix socket 0666 → 0600 收紧权限。webroot changelog 精简(48 → 6 可见版本,减 80% 行数)。继承 v3.6.2 的 webroot 回退和 v3.6.0 的 hotspotd pending 异步化。详见 CHANGELOG.md。
+description=热点设备管控 v3.7.0 · 新增 DHCP hostname 自动识别。通过 dumpsys network_stack 从 Android 14+ 的 NetworkStack ring buffer 提取 DHCP option 12(Host Name),Windows/小米/华为等 OEM 设备会自动显示真实名字(Mi-10, DESKTOP-ABC 等)。hostname 优先级链:manual > dhcp > mdns > mac。35ms 耗时 vs mdns 的 800ms,DHCP 是被动数据零网络成本。两次独立 AI 审查(Gemini + 另一方)共同发现的方案。详见 CHANGELOG.md。
 minKernelSU=11485

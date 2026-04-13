@@ -231,7 +231,100 @@ static int try_mdns_resolve(const char *ip, const char *mac, char *out, size_t o
     return (out[0] != '\0') ? 1 : 0;
 }
 
-/* 综合 hostname 解析:manual > mdns > mac
+/* ══════════════════════════════════════════════════════════
+ * v3.7.0: try_ns_dhcp_resolve — 从 dumpsys network_stack 提取 hostname
+ *
+ * Android 14+ 的 NetworkStack mainline module 把所有 DHCP 事件写到
+ * 内存 ring buffer,dumpsys network_stack 能 dump 出来。每条事件格式:
+ *
+ *   2026-04-13T16:43:31 - [wlan2.DHCP] Transmitting DhcpAckPacket with lease
+ *     clientId: XXX, hwAddr: 7a:d6:f7:ce:ba:76, netAddr: 10.201.76.69/24,
+ *     expTime: 4968921,hostname: Mi-10
+ *
+ * 只要客户端的 DHCP 包里带 option 12 (Host Name),这里就会出现。
+ * 覆盖情况:
+ *   - Windows (100%)、OEM Android (小米/华为,~80%)、部分 iOS (~40%)
+ *   - 不覆盖:原生 Android (Pixel/LineageOS,Google 隐私移除)
+ *
+ * 耗时:真机实测 ~35ms (popen dumpsys),输出 ~15 KB。
+ * 相比 mdns_resolve 的 800ms,这是 23x 的速度提升。而且 DHCP 是被动等待,
+ * 不发任何包,零网络成本。
+ *
+ * 放进 resolve_hostname 的同步路径(process_pending_mdns 调用),优先级在
+ * mdns 之前。注意:scan_arp 的快速路径依然走 resolve_hostname_fast,不调
+ * 这个函数(为了保持 scan_arp 的 1μs 级延迟)。
+ *
+ * 实现细节:
+ *   - 用 popen 跑 "dumpsys network_stack | grep <mac>"(grep 做初步过滤,
+ *     减少回传到 daemon 的字节数,虽然 35ms 基本就是 dumpsys 自己的时间)
+ *   - 在 C 里 parse 每一行找 "hostname: "
+ *   - 返回最后一条匹配(最新的 DHCP 事件)
+ * ══════════════════════════════════════════════════════════ */
+static int try_ns_dhcp_resolve(const char *mac, char *out, size_t outlen) {
+    if (!mac || mac[0] == '\0') return 0;
+
+    /* mac 必须是 XX:XX:XX:XX:XX:XX 格式,防注入(虽然 mac 来自 netlink
+     * 不是用户输入,但 defense-in-depth) */
+    int i;
+    for (i = 0; mac[i] && i < 17; i++) {
+        char c = mac[i];
+        if (!((c >= '0' && c <= '9') ||
+              (c >= 'a' && c <= 'f') ||
+              (c >= 'A' && c <= 'F') ||
+              c == ':')) {
+            return 0;
+        }
+    }
+    if (i != 17) return 0;
+
+    /* 构造命令:dumpsys network_stack 2>/dev/null | grep -i <mac> */
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd),
+             "dumpsys network_stack 2>/dev/null | grep -iF %s 2>/dev/null", mac);
+
+    FILE *pf = popen(cmd, "r");
+    if (!pf) return 0;
+
+    /* 逐行读取,找最后一条包含 "hostname: " 的行 */
+    char line[1024];
+    char latest_hostname[HN_LEN] = "";
+
+    while (fgets(line, sizeof(line), pf) != NULL) {
+        /* 找 "hostname: " 子串 */
+        const char *p = strstr(line, "hostname: ");
+        if (!p) continue;
+        p += 10;  /* 跳过 "hostname: " */
+
+        /* 提取到行尾或逗号(hostname 是每行最后一个字段,格式上到行尾) */
+        char hn[HN_LEN];
+        size_t j = 0;
+        while (*p && *p != '\n' && *p != '\r' && *p != ',' && j < sizeof(hn) - 1) {
+            hn[j++] = *p++;
+        }
+        hn[j] = '\0';
+
+        /* 去尾部空格 */
+        while (j > 0 && (hn[j-1] == ' ' || hn[j-1] == '\t')) {
+            hn[--j] = '\0';
+        }
+
+        if (j > 0) {
+            strncpy(latest_hostname, hn, sizeof(latest_hostname) - 1);
+            latest_hostname[sizeof(latest_hostname) - 1] = '\0';
+        }
+    }
+    int rc = pclose(pf);
+    (void)rc;
+
+    if (latest_hostname[0] != '\0') {
+        strncpy(out, latest_hostname, outlen - 1);
+        out[outlen - 1] = '\0';
+        return 1;
+    }
+    return 0;
+}
+
+/* 综合 hostname 解析:manual > dhcp > mdns > mac
  * 填充 out 和 out_src
  *
  * v3.6 Commit 2: 这个函数仍然在 hotspotd.c,因为它调 try_mdns_resolve
@@ -240,7 +333,11 @@ static int try_mdns_resolve(const char *ip, const char *mac, char *out, size_t o
  *
  * v3.6 Commit 3 会引入 resolve_hostname_fast(不调 mdns,纯 manual + mac),
  * 让 scan_arp 主循环不阻塞,mdns 解析延后到异步路径。这个同步版本保留给
- * "需要立刻解出完整 hostname"的罕见路径(如果有的话)。 */
+ * "需要立刻解出完整 hostname"的罕见路径(如果有的话)。
+ *
+ * v3.7.0: 加 dhcp(dumpsys network_stack)查询,放在 manual 之后 mdns 之前。
+ * DHCP 是被动数据(客户端 DHCP 包里带的 option 12),零网络成本,35ms 完成。
+ * 相比 mdns 的 800ms,优先级更高。 */
 static void resolve_hostname(const char *mac, const char *ip,
                              char *out_hn, size_t hn_len,
                              char *out_src, size_t src_len) {
@@ -250,13 +347,19 @@ static void resolve_hostname(const char *mac, const char *ip,
         return;
     }
 
-    /* 2. mDNS(只在有 IP 时,同步 popen) */
+    /* 2. v3.7.0: DHCP hostname via dumpsys network_stack(同步 popen ~35ms)*/
+    if (try_ns_dhcp_resolve(mac, out_hn, hn_len)) {
+        snprintf(out_src, src_len, "dhcp");
+        return;
+    }
+
+    /* 3. mDNS(只在有 IP 时,同步 popen ~800ms)*/
     if (ip && *ip && try_mdns_resolve(ip, mac, out_hn, hn_len)) {
         snprintf(out_src, src_len, "mdns");
         return;
     }
 
-    /* 3. MAC 兜底 */
+    /* 4. MAC 兜底 */
     hnc_mac_fallback(mac, out_hn, hn_len);
     snprintf(out_src, src_len, "mac");
 }

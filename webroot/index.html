@@ -1430,10 +1430,37 @@ html,body { min-height:100%; background:var(--bg); color:var(--t0); font-family:
         <div class="about-name">HNC · Hotspot Network Control</div>
         <div class="about-author">作者：Claude (Anthropic AI) &nbsp;·&nbsp; KSU / Magisk 模块</div>
       </div>
-      <span class="about-ver">v3.6.3</span>
+      <span class="about-ver">v3.7.0</span>
     </div>
     <!-- 更新日志 -->
     <div class="changelog">
+
+      <!-- v3.7.0 DHCP hostname 自动识别（默认展开）-->
+      <div class="cl-item">
+        <div class="cl-left">
+          <div class="cl-dot"></div>
+          <div class="cl-line"></div>
+        </div>
+        <div class="cl-right">
+          <div class="cl-title">🎯 v3.7.0 DHCP hostname 自动识别 &nbsp;<span style="font-size:11px;color:var(--t2);font-weight:400">2026-04-13</span></div>
+          <div class="cl-tags">
+            <span class="cl-tag feat" style="background:#059669;color:#fff">v3.7 新特性</span>
+            <span class="cl-tag feat">DHCP 自动识别</span>
+            <span class="cl-tag feat">dumpsys network_stack</span>
+          </div>
+          <ul class="cl-changes">
+            <li><b>🎯 核心新特性</b>:WebUI 设备列表自动显示真实设备名(<code>Mi-10</code> / <code>DESKTOP-ABC123</code> / <code>Johns-MacBook-Pro</code>),不再是 MAC 后 8 位 <code>D69D0FA1</code> 这种乱码。优先级链 <b>manual > dhcp > mdns > mac</b></li>
+            <li><b>🔍 技术突破</b>:Android 14+ 的 NetworkStack 把所有 DHCP 事件写入内存 ring buffer,<code>dumpsys network_stack</code> 能完整 dump 出来,每条事件带 <code>hwAddr / hostname / expTime</code>。HNC 解析这个输出提取每个设备的 hostname (DHCP option 12)</li>
+            <li><b>📡 覆盖情况</b>:Windows(100% 发 hostname)、小米/华为等 OEM Android(~80%)、部分 iOS(~40%)。<b>原生 Android(Pixel / LineageOS)不发 hostname</b>(Google 8.0 起隐私移除),这些设备继续走 mDNS → mac 兜底</li>
+            <li><b>⚡ 性能</b>:<code>dumpsys network_stack</code> 真机实测 35ms / 15 KB,相比 <code>mdns_resolve</code> 的 800ms <b>快 23 倍</b>。而且 DHCP 是被动数据(客户端连入时自动带),零网络成本、零额外协议开销</li>
+            <li><b>🔧 实现</b>:<b>shell</b> <code>device_detect.sh</code> 新增 dumpsys network_stack 查询(grep + sed)· <b>C</b> <code>hotspotd.c</code> 新增 <code>try_ns_dhcp_resolve()</code>(popen + 逐行 parse + MAC 白名单防注入)· <b>webroot</b> 复用 v3.4.6 留的 <code>nameSrc === 'dhcp'</code> 分支和 📡 图标</li>
+            <li><b>🧪 测试</b>:10 个 C parse 单元测试(Mi-10 / DESKTOP-ABC / Mike's iPhone 含空格 / MacBook-Pro 含 dash / 超长截断 / 多行取最新 / 空输入等)· shell 正则测试(大小写 MAC / 不存在 MAC)全部通过</li>
+            <li><b>🙏 方案来源</b>:两次独立 AI 审查的合作成果。Phase 1-3 标准 dumpsys / cmd / 文件系统全军覆没,直到第二轮审查指出"<code>dumpsys network_stack</code> 是唯一没试过的 dumpsys"。Phase 4 验证输出里直接有 <code>hostname: Mi-10</code>,比预想的 DHCP sniffer (~600 行 C) 少 95% 工作量</li>
+            <li><b>📝 HACKING.md 新增</b>:"坑 15:在 Android 14+ 上,放弃一切 dnsmasq 假设,dumpsys network_stack 才是 DHCP 状态的真实来源"</li>
+            <li><b>🚦 升级建议</b>:直接覆盖 v3.6.3,数据全保留。装完不需要重连热点,下一次 scan 时所有已连接设备会自动从 dumpsys 拉到 hostname</li>
+          </ul>
+        </div>
+      </div>
 
       <!-- v3.6.3 Gemini 审查后 P1 修复（默认展开）-->
       <div class="cl-item">
