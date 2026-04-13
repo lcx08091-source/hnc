@@ -1430,10 +1430,35 @@ html,body { min-height:100%; background:var(--bg); color:var(--t0); font-family:
         <div class="about-name">HNC · Hotspot Network Control</div>
         <div class="about-author">作者：Claude (Anthropic AI) &nbsp;·&nbsp; KSU / Magisk 模块</div>
       </div>
-      <span class="about-ver">v3.8.0</span>
+      <span class="about-ver">v3.8.1</span>
     </div>
     <!-- 更新日志 -->
     <div class="changelog">
+
+      <!-- v3.8.1 持久化 cache + diag 假警报修复（默认展开）-->
+      <div class="cl-item">
+        <div class="cl-left">
+          <div class="cl-dot"></div>
+          <div class="cl-line"></div>
+        </div>
+        <div class="cl-right">
+          <div class="cl-title">💾 v3.8.1 DHCP/mDNS hostname 持久化 cache + diag 假警报修复 &nbsp;<span style="font-size:11px;color:var(--t2);font-weight:400">2026-04-14</span></div>
+          <div class="cl-tags">
+            <span class="cl-tag feat" style="background:#059669;color:#fff">大 v3.8 阶段 2/6</span>
+            <span class="cl-tag feat">持久化 cache</span>
+            <span class="cl-tag fix">diag 假警报</span>
+          </div>
+          <ul class="cl-changes">
+            <li><b>💾 A3 DHCP/mDNS hostname 持久化 cache</b>:Gemini P1-7 审查指出的问题正式修复。一旦设备被 DHCP 或 mDNS 成功识别,名字会写入 <code>/data/local/hnc/data/hostname_cache.json</code>。即使 <code>dumpsys network_stack</code> ring buffer 滚出了旧 DHCP 事件,或者 hotspotd 重启,重连的设备依然能立即恢复真名,不会退化为 "Xiaomi 设备" 或 "D69D0FA1"</li>
+            <li><b>🔗 优先级链变化</b>:<code>manual > dhcp > mdns > <b>cache(新)</b> > oui > mac</code>。cache 优先级放在 OUI 之前,因为缓存的是**精确识别结果**(Mi-10/iPhone 14),比 OUI 的模糊"Apple 设备"更有价值</li>
+            <li><b>🏗️ 实现细节</b>:独立模块 <code>daemon/hostname_cache.c</code>(343 行),1024 条上限 + LRU 淘汰(按 updated_at),原子 tmp+rename 写盘,load 时能安全处理空文件/损坏 JSON/垃圾数据不 crash,MAC 大小写不敏感匹配,相同数据 update 不标 dirty(避免无意义 fsync)。de-bounce 跟 devices.json 共享写入窗口</li>
+            <li><b>🎨 WebUI 新图标</b>:<code>hostname_src === 'cache-dhcp'</code> 或 <code>'cache-mdns'</code> 的设备显示 💾 图标,title 提示"历史缓存识别"</li>
+            <li><b>🔧 diag.sh 修复 1 — 安装目录检查</b>:之前 [1/14] 检查 <code>$HNC/module.prop</code>,但 module.prop 实际在 <code>/data/adb/modules/hotspot_network_control/</code>(Magisk/KernelSU 模块目录),不在 <code>/data/local/hnc</code>(运行目录)。这个 FAIL 从 v3.5 开始就有,一直没人修。现在检查正确路径</li>
+            <li><b>🔧 diag.sh 修复 2 — hotspotd 防误用检查过时</b>:v3.4.11 时代写的 "LTS 期不应启用 hotspotd" 已经过时,hotspotd 从 v3.5+ 开始就是默认 daemon。改成"检查 daemon 是否运行",binary 存在 + 进程运行 → OK,binary 存在但进程不在 → WARN "watchdog 会在 60s 内拉起"</li>
+            <li><b>🧪 测试</b>:37 个 hostname_cache 新单元测试(init/reset/count + update 新建/覆盖/无变化 + lookup 命中/未命中/大小写 + save/load 往返含 JSON 特殊字符 + 损坏文件安全处理 + LRU 行为)+ 146 历史回归,共 183 全过,零 warning 编译</li>
+          </ul>
+        </div>
+      </div>
 
       <!-- v3.8.0 大 v3.8 阶段 1:OUI 厂商兜底 + 格式探针（默认展开）-->
       <div class="cl-item">
@@ -2647,6 +2672,7 @@ function cardHTML(d, isExp, idx) {
   if (nameSrc === 'manual')  srcIcon = '<span class="name-src-icon manual" onclick="event.stopPropagation();window.editName(\''+emAttr+'\',\''+nmAttr+'\')" title="手动命名,点击修改">\u270F\uFE0F</span>';
   else if (nameSrc === 'mdns') srcIcon = '<span class="name-src-icon" onclick="event.stopPropagation();window.editName(\''+emAttr+'\',\''+nmAttr+'\')" title="mDNS 自动识别,点击修改">\uD83D\uDD0D</span>';
   else if (nameSrc === 'dhcp') srcIcon = '<span class="name-src-icon" onclick="event.stopPropagation();window.editName(\''+emAttr+'\',\''+nmAttr+'\')" title="DHCP 客户端汇报,点击修改">\uD83D\uDCE1</span>';
+  else if (nameSrc.indexOf('cache') === 0) srcIcon = '<span class="name-src-icon" onclick="event.stopPropagation();window.editName(\''+emAttr+'\',\''+nmAttr+'\')" title="历史缓存识别('+nameSrc.substring(6)+'),点击修改">\uD83D\uDCBE</span>';
   else if (nameSrc === 'oui')  srcIcon = '<span class="name-src-icon" onclick="event.stopPropagation();window.editName(\''+emAttr+'\',\''+nmAttr+'\')" title="OUI 厂商识别(非精确),点击命名">\uD83C\uDFF7\uFE0F</span>';
   else /* mac fallback / pending */ srcIcon = '<span class="name-src-icon mac" onclick="event.stopPropagation();window.editName(\''+emAttr+'\',\'\')" title="未识别,点击命名">\u270F\uFE0F</span>';
 
@@ -3459,6 +3485,7 @@ function updateCardFields(card, d) {
     if (nameSrc === 'manual')      newSrcHTML = '<span class="name-src-icon manual" onclick="event.stopPropagation();window.editName(\''+emAttr+'\',\''+nmAttr+'\')" title="手动命名,点击修改">\u270F\uFE0F</span>';
     else if (nameSrc === 'mdns')   newSrcHTML = '<span class="name-src-icon" onclick="event.stopPropagation();window.editName(\''+emAttr+'\',\''+nmAttr+'\')" title="mDNS 自动识别,点击修改">\uD83D\uDD0D</span>';
     else if (nameSrc === 'dhcp')   newSrcHTML = '<span class="name-src-icon" onclick="event.stopPropagation();window.editName(\''+emAttr+'\',\''+nmAttr+'\')" title="DHCP 客户端汇报,点击修改">\uD83D\uDCE1</span>';
+    else if (nameSrc.indexOf('cache') === 0) newSrcHTML = '<span class="name-src-icon" onclick="event.stopPropagation();window.editName(\''+emAttr+'\',\''+nmAttr+'\')" title="历史缓存识别('+nameSrc.substring(6)+'),点击修改">\uD83D\uDCBE</span>';
     else if (nameSrc === 'oui')    newSrcHTML = '<span class="name-src-icon" onclick="event.stopPropagation();window.editName(\''+emAttr+'\',\''+nmAttr+'\')" title="OUI 厂商识别(非精确),点击命名">\uD83C\uDFF7\uFE0F</span>';
     /* v3.6.2: 回退 pending 分支(装机后 WebUI 空白),当作 mac 降级显示 */
     else /* mac / pending */       newSrcHTML = '<span class="name-src-icon mac" onclick="event.stopPropagation();window.editName(\''+emAttr+'\',\'\')" title="未识别,点击命名">\u270F\uFE0F</span>';

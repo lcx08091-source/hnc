@@ -1,7 +1,7 @@
 id=hotspot_network_control
 name=Hotspot Network Control
-version=v3.8.0
-versionCode=3800
+version=v3.8.1
+versionCode=3801
 author=Claude (Anthropic AI)
-description=热点设备管控 v3.8.0 · 阶段 1/6 (大 v3.8 首个里程碑) · 新增 OUI 厂商查表兜底(Apple/Xiaomi/Huawei/Google/OPPO/vivo/Samsung/Dell/HP/Lenovo/Microsoft/Intel/Sony/Nintendo/Amazon/Raspberry-Pi/Espressif 等 444 条前缀),让 Pixel/原生 Android 等不发 DHCP option 12 的设备从 MAC 后 8 位(如 D69D0FA1)显示升级为 "Google 设备" / "Apple 设备"。自动跳过随机 MAC (locally-administered bit)。新增 dumpsys network_stack 格式探针到 diag.sh,Android 版本升级后格式变化会被立即检测。HACKING.md 归档了今天 7 次迭代的 6 条经典坑教训。21 个 OUI 单元测试 + 164 历史回归全过。
+description=热点设备管控 v3.8.1 · 大 v3.8 阶段 2/6 · A3 DHCP/mDNS hostname 持久化 cache(Gemini P1-7 修复)。新增 daemon/hostname_cache.c 独立模块,一旦成功识别设备真名就写入 /data/local/hnc/data/hostname_cache.json,即使 dumpsys ring buffer 滚出或 hotspotd 重启,重连设备依然能立即恢复真名。优先级链新增第 4 级:manual > dhcp > mdns > cache(新) > oui > mac。cache 大小 1024 条上限,LRU 淘汰,原子 tmp+rename 写盘,de-bounce 跟 devices.json 共享写入窗口。WebUI 新增 💾 图标显示"历史缓存识别"。顺手修复 diag.sh 两个假警报(安装目录检查错路径 + hotspotd 防误用过时警告)。37 个 hostname_cache 新单元测试 + 183 历史回归全过。
 minKernelSU=11485

@@ -54,6 +54,7 @@
  * 现在主代码和测试都 #include 同一个头文件,link 同一个 hnc_helpers.o,
  * 彻底消除复制 drift。 */
 #include "hnc_helpers.h"
+#include "hostname_cache.h"  /* v3.8.1: DHCP/mDNS hostname 持久化 cache */
 
 /* 兼容性宏：部分 libc/内核头文件版本不导出 NDM_RTA/NDM_PAYLOAD */
 #ifndef NDM_RTA
@@ -76,6 +77,7 @@
 #define ARP_PROC            "/proc/net/arp"
 #define RULES_JSON          HNC_DIR "/data/rules.json"
 #define DEVICE_NAMES_JSON   HNC_DIR "/data/device_names.json"   /* v3.5.0 P0-4 */
+#define HOSTNAME_CACHE_JSON HNC_DIR "/data/hostname_cache.json" /* v3.8.1 A3 */
 #define MDNS_RESOLVE_BIN    HNC_DIR "/bin/mdns_resolve"         /* v3.5.0 P0-4 */
 #define IPTABLES_MGR        HNC_DIR "/bin/iptables_manager.sh"  /* v3.5.1 P1-2 */
 
@@ -515,23 +517,43 @@ static void resolve_hostname(const char *mac, const char *ip,
     /* 2. v3.7.0: DHCP hostname via dumpsys network_stack(同步 ~35ms)*/
     if (try_ns_dhcp_resolve(mac, out_hn, hn_len)) {
         snprintf(out_src, src_len, "dhcp");
+        /* v3.8.1: 命中 DHCP 时更新 cache,为后续 ring buffer 滚出时兜底 */
+        hnc_cache_update(mac, out_hn, "dhcp");
         return;
     }
 
     /* 3. mDNS(只在有 IP 时,同步 popen ~800ms)*/
     if (ip && *ip && try_mdns_resolve(ip, mac, out_hn, hn_len)) {
         snprintf(out_src, src_len, "mdns");
+        /* v3.8.1: 命中 mDNS 时也更新 cache */
+        hnc_cache_update(mac, out_hn, "mdns");
         return;
     }
 
-    /* 4. v3.8.0: OUI 厂商表兜底(Apple/Xiaomi/Huawei/... 444 条)
-     * 随机 MAC (LAA bit=1) 会被 hnc_lookup_oui 自动跳过 */
+    /* 4. v3.8.1: 持久化 cache 兜底
+     * 如果之前这台设备 DHCP/mDNS 命中过,cache 里有记录,即使现在
+     * dumpsys ring buffer 已滚出也能恢复真名。
+     *
+     * cache 里存的 src 是"原始识别来源",这里包一层 "cache:xxx" 标注,
+     * WebUI 可以显示"这是从缓存读的,不是最新鲜的数据"。*/
+    char cached_hn[HN_LEN];
+    char cached_src[16];
+    if (hnc_cache_lookup(mac, cached_hn, sizeof(cached_hn),
+                         cached_src, sizeof(cached_src))) {
+        strncpy(out_hn, cached_hn, hn_len - 1);
+        out_hn[hn_len - 1] = '\0';
+        /* src 标注为 "cache-<原始>",区别于 live 识别 */
+        snprintf(out_src, src_len, "cache-%s", cached_src);
+        return;
+    }
+
+    /* 5. v3.8.0: OUI 厂商表兜底 */
     if (hnc_lookup_oui(mac, out_hn, hn_len)) {
         snprintf(out_src, src_len, "oui");
         return;
     }
 
-    /* 5. MAC 兜底(最后的 fallback) */
+    /* 6. MAC 兜底(最后的 fallback) */
     hnc_mac_fallback(mac, out_hn, hn_len);
     snprintf(out_src, src_len, "mac");
 }
@@ -580,16 +602,31 @@ static void resolve_hostname_dhcp_only(const char *mac,
     /* 2. DHCP */
     if (try_ns_dhcp_resolve(mac, out_hn, hn_len)) {
         snprintf(out_src, src_len, "dhcp");
+        hnc_cache_update(mac, out_hn, "dhcp");  /* v3.8.1: 更新 cache */
         return;
     }
 
-    /* 3. v3.8.0: OUI 厂商表兜底 */
+    /* 3. v3.8.1: 持久化 cache 兜底
+     * pending 路径不查 mDNS 避免阻塞,所以 cache 是 mDNS 命中结果的
+     * 唯一"即时回放"机制。对于之前通过 mDNS 识别到的 iPhone/Mac 等,
+     * 重连时 cache 能立即提供正确名字,不需要等 60s re-resolve */
+    char cached_hn[HN_LEN];
+    char cached_src[16];
+    if (hnc_cache_lookup(mac, cached_hn, sizeof(cached_hn),
+                         cached_src, sizeof(cached_src))) {
+        strncpy(out_hn, cached_hn, hn_len - 1);
+        out_hn[hn_len - 1] = '\0';
+        snprintf(out_src, src_len, "cache-%s", cached_src);
+        return;
+    }
+
+    /* 4. v3.8.0: OUI 厂商表兜底 */
     if (hnc_lookup_oui(mac, out_hn, hn_len)) {
         snprintf(out_src, src_len, "oui");
         return;
     }
 
-    /* 4. MAC 兜底(不走 mDNS,避免主循环阻塞 800ms) */
+    /* 5. MAC 兜底(不走 mDNS,避免主循环阻塞 800ms) */
     hnc_mac_fallback(mac, out_hn, hn_len);
     snprintf(out_src, src_len, "mac");
 }
@@ -1307,6 +1344,15 @@ int main(int argc, char *argv[]) {
 
     hlog("Listening on netlink RTGRP_NEIGH + %s", SOCK_PATH);
 
+    /* v3.8.1 A3: 加载持久化 hostname cache
+     * 如果文件不存在(首次启动)load 返回 0,正常。
+     * 如果加载成功,cache 里的旧记录会在 resolve_hostname 的第 4 级生效,
+     * 让重连设备即使 dumpsys ring buffer 滚出也能显示真名。*/
+    hnc_cache_init(HOSTNAME_CACHE_JSON);
+    int cache_loaded = hnc_cache_load();
+    hlog("hostname cache: loaded %d entries from %s",
+         cache_loaded, HOSTNAME_CACHE_JSON);
+
     /* 初始扫描 */
     scan_arp();
 
@@ -1383,6 +1429,14 @@ int main(int argc, char *argv[]) {
              * b) 距首次 dirty >= 30s(强制兜底) */
             if (last_event >= 1 || elapsed >= 30) {
                 write_json();
+                /* v3.8.1: 顺带 save hostname cache(如果 dirty)
+                 * cache save 跟 devices.json save 共享同一个 de-bounce 窗口,
+                 * 避免频繁 fsync。cache save 失败不影响主循环。*/
+                if (hnc_cache_is_dirty()) {
+                    if (hnc_cache_save() != 0) {
+                        hlog("WARN: hostname cache save failed: %s", strerror(errno));
+                    }
+                }
                 dirty_since = 0;  /* reset de-bounce 窗口 */
             }
         }
@@ -1424,6 +1478,11 @@ cleanup:
     hlog("hotspotd shutting down");
     /* 最后写一次 JSON */
     if (g_dirty) write_json();
+    /* v3.8.1: 最后 save 一次 hostname cache,保证关机前的识别结果落盘 */
+    if (hnc_cache_is_dirty()) {
+        hnc_cache_save();
+        hlog("hostname cache: final save on shutdown");
+    }
     if (g_nl_fd  >= 0) close(g_nl_fd);
     if (g_srv_fd >= 0) { close(g_srv_fd); unlink(SOCK_PATH); }
     /* v3.5.2 P1-D: 验证 PID 文件是自己的才 unlink */

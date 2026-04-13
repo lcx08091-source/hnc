@@ -54,9 +54,13 @@ jobs:
           ./test_mdns_parse
           # v3.6 Commit 2: test_hostname_helpers 现在 #include ../hnc_helpers.h
           # 需要 link ../hnc_helpers.c 才能解出 hnc_* 符号
-          gcc -Wall -Wextra -o test_hostname_helpers \
+          gcc -Wall -Wextra -I .. -o test_hostname_helpers \
               test_hostname_helpers.c ../hnc_helpers.c
           ./test_hostname_helpers
+          # v3.8.1 A3: hostname_cache 单元测试
+          gcc -Wall -Wextra -I .. -o test_hostname_cache \
+              test_hostname_cache.c ../hostname_cache.c ../hnc_helpers.c
+          ./test_hostname_cache
 
   build:
     name: Cross-compile binaries
@@ -95,13 +99,13 @@ jobs:
       - name: Cross-compile hotspotd (arm64-v8a static)
         run: |
           # v3.6 Commit 2: 编译 hotspotd.c + hnc_helpers.c
-          # hnc_helpers.c 含提取出的纯 helper 函数,测试也 link 同一个文件
+          # v3.8.1 A3: 新增 hostname_cache.c 持久化 DHCP/mDNS 识别结果
           $CC \
             -O2 \
             -Wall -Wextra -Wno-unused-parameter \
             -static \
             -o bin/hotspotd \
-            daemon/hotspotd.c daemon/hnc_helpers.c
+            daemon/hotspotd.c daemon/hnc_helpers.c daemon/hostname_cache.c
           $STRIP bin/hotspotd
           file bin/hotspotd
           ls -lh bin/hotspotd

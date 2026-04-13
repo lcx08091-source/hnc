@@ -12,10 +12,9 @@ cd "$(dirname "$0")"
 
 ARCH=${1:-arm64}
 # v3.6 Commit 2: 编译 hotspotd.c + hnc_helpers.c
-# hnc_helpers.c 包含从 hotspotd.c 提取的纯 helper 函数(should_re_resolve,
-# json_escape, lookup_manual_name, mac_fallback, resolve_hostname_fast),
-# 测试文件也 link 同一个 .c,彻底消除 v3.5.1/v3.5.2 遗留的复制 drift 风险。
-SRCS="hotspotd.c hnc_helpers.c"
+# hnc_helpers.c 包含从 hotspotd.c 提取的纯 helper 函数。
+# v3.8.1 A3: 新增 hostname_cache.c,持久化 DHCP/mDNS 识别结果。
+SRCS="hotspotd.c hnc_helpers.c hostname_cache.c"
 OUTDIR=prebuilt/${ARCH}
 OUT=${OUTDIR}/hotspotd
 
