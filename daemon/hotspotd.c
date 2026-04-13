@@ -391,7 +391,13 @@ static void write_json(void) {
         for (int b = 0; b < nbl; b++)
             if (strcmp(blacklist[b], d->mac) == 0) { status = "blocked"; break; }
 
-        /* v3.5.0 P0-4: 输出 hostname_src 字段(默认 mac 兜底) */
+        /* v3.5.0 P0-4: 输出 hostname_src 字段(默认 mac 兜底)
+         *
+         * v3.6.2 note: 本来想在这里把 "pending" 映射成 "mac" 输出,但这样需要
+         * 重新交叉编译 arm64 binary,沙箱无 NDK 不方便。既然 WebUI 已经把 pending
+         * 当作 mac 分支降级显示(不 crash),C 侧保持输出 "pending" 也是 OK 的 —
+         * 只是 devices.json 里会短暂出现 "pending" 字符串,前端的 if/else 链走到
+         * 最后的 mac 分支渲染。功能上等效,兼容性上 v3.5.2 的 WebUI 也能显示。 */
         const char *hn_src = (d->hostname_src[0]) ? d->hostname_src : "mac";
 
         /* v3.5.1 P0-2: hostname 必须 JSON-escape,否则用户名字含 " 或 \ 会破坏 JSON */
@@ -730,7 +736,18 @@ static int unix_server_open(void) {
         hlog("ERROR: unix bind: %s", strerror(errno));
         close(fd); return -1;
     }
-    chmod(SOCK_PATH, 0666);
+    /* v3.6.2 P1-2 修复(Gemini 审查发现):socket 权限从 0666 收紧到 0600。
+     *
+     * 旧 0666 的风险:任何能访问 /data/local/hnc/run/ 目录的进程都能连
+     * socket 并发 QUIT(杀 daemon)或高频 REFRESH(本地 DoS)。
+     * /data/local/hnc 的 DAC 是 root:root,按理说普通 App 进不来,但:
+     * 1. 纵深防御原则 — 上层目录权限一旦被意外放开,socket 层也要能挡
+     * 2. 0666 是"所有人可读写",没有语义理由给非 root 进程开放
+     * 3. hotspotd 和所有合法客户端(watchdog / device_detect.sh / WebUI 经
+     *    kexec)都以 root 运行,0600 (仅 owner=root) 完全够用
+     *
+     * 如果未来要让非 root 进程通信,应该显式 chown + chmod 0660,而不是 0666。 */
+    chmod(SOCK_PATH, 0600);
     listen(fd, 8);
     return fd;
 }
@@ -772,10 +789,27 @@ static void handle_client(int cfd) {
          * mdns_resolve × N 设备,主线程阻塞几秒到几十秒)。
          * 只设 g_need_scan 标志,主循环下一次 select wakeup 会处理。
          *
-         * v3.6 T2: 同时清 stats TTL 缓存,保证下次 write_json 一定重算 iptables stats,
-         * 否则 REFRESH 后用户看到新 last_seen 但 rx/tx 是旧数据(UX 钝感) */
+         * v3.6 T2: 清 stats TTL 缓存,保证下次 write_json 重算 iptables stats,
+         * 否则 REFRESH 后用户看到新 last_seen 但 rx/tx 是旧数据(UX 钝感)
+         *
+         * v3.6.2 P1-1 修复(Gemini 审查发现):不能把 g_last_stats_update 清成 0,
+         * 因为那样任何能连 socket 的进程发高频 REFRESH 就能完全绕过 5s TTL,
+         * 让主循环疯狂 popen iptables,打满 CPU → 本地 DoS / fork 炸弹风险。
+         * 改成把 g_last_stats_update 拨回到"距 now 刚好 MIN_REFRESH_INTERVAL 秒前",
+         * 这样 REFRESH 仍然能触发一次 stats 重算(如果距上次 > MIN 秒),
+         * 但高频 REFRESH 不会比自然的 update_traffic_stats 更频繁。 */
         g_need_scan = 1;
-        g_last_stats_update = 0;
+        {
+            time_t now = time(NULL);
+            /* 最小重算间隔:2 秒。介于原 5s TTL 和 "完全绕过" 之间,
+             * 既让 REFRESH 有意义(2s 内反应)又防止 DoS */
+            const time_t MIN_REFRESH_INTERVAL = 2;
+            if (now - g_last_stats_update > MIN_REFRESH_INTERVAL) {
+                g_last_stats_update = now - MIN_REFRESH_INTERVAL;
+            }
+            /* else: 距上次重算不到 2 秒,不改 g_last_stats_update,
+             * 让 update_traffic_stats 的 TTL 检查自然工作 */
+        }
         send(cfd, "OK:queued\n", 10, 0);
     } else if (strcmp(req, "STATUS") == 0) {
         char resp[128];

@@ -294,7 +294,8 @@ do_scan_shell() {
     mkdir -p "$HNC_DIR/run" 2>/dev/null
     : > "$TMP"
     # v3.5.0 P2-3: 进程异常退出时清理临时文件,避免 /run 累积垃圾
-    trap 'rm -f "$TMP" "$ARP_TMP" 2>/dev/null' EXIT INT TERM
+    # v3.6.1 P1-shellrace: 加 devices.json.tmp.$$ 清理(以防 printf/mv 之间死亡)
+    trap 'rm -f "$TMP" "$ARP_TMP" "${DEVICES_FILE}.tmp.$$" 2>/dev/null' EXIT INT TERM
 
     # 写 ARP 扫描结果到临时文件(这一步即使在 subshell 也无所谓,因为它本来就在命令替换里)
     awk 'NR>1 && $3!="0x0" && $4!="00:00:00:00:00:00" && $1~/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $6!~/^(lo|rmnet|dummy|v4-|tun|p2p)/ {print $1"|"$4"|"$6}' /proc/net/arp 2>/dev/null > "$ARP_TMP"
@@ -372,8 +373,23 @@ do_scan_shell() {
     json="${json}}"
 
     rm -f "$TMP"
-    printf '%s' "$json" > "${DEVICES_FILE}.tmp" && \
-        mv "${DEVICES_FILE}.tmp" "$DEVICES_FILE"
+    # v3.6.1 P1-shellrace 修复:用带 PID 后缀的 tmp 文件,避免多个 shell scan
+    # 并发时对 devices.json.tmp 字节级竞争写入导致 JSON 字段错位。
+    #
+    # 真实事故(2026-04-13):用户点"释放所有资源"后,hotspotd 被 cleanup 杀掉,
+    # WebUI 在 90 秒内多次触发 device_detect.sh scan(人为快速点"刷新" 或 WebUI
+    # 自动 doRefresh 触发 shell fallback 路径)。几次 scan 的执行窗口重叠,
+    # 两个 printf > devices.json.tmp 并发 write 字节交错,产生看似合法但字段
+    # 错位的 JSON,例如 "iface":"","status":"wlan2|allowed"(iface 变空串,
+    # status 吃掉了 wlan2 + | + allowed 的拼接)。
+    #
+    # hotspotd.c v3.5.2 P0-A 的 DEVICES_TMP_FMT 已经用 "devices.json.tmp.%d"
+    # 格式(带 PID 后缀,作为纵深防御),shell 侧应该对齐。
+    #
+    # $$ 是当前 shell 的 PID,每个 scan 子进程唯一。mv 是原子操作(kernel 保证
+    # rename 的原子性),所以谁后 mv 谁赢,但至少每个 tmp 文件本身是完整的 JSON。
+    local tmp_out="${DEVICES_FILE}.tmp.$$"
+    printf '%s' "$json" > "$tmp_out" && mv "$tmp_out" "$DEVICES_FILE"
     log "shell scan: $count device(s)"
     echo "$count"
 }

@@ -1,7 +1,0 @@
-id=hotspot_network_control
-name=Hotspot Network Control
-version=v3.6.0
-versionCode=3600
-author=Claude (Anthropic AI)
-description=热点设备管控 v3.6.0 架构收尾版 · 修 P0-B 核心(scan_arp pending 异步) + helpers 提取(P1-3/P1-A 彻底消除) + 5 项技术债清理(T1/T2/T4/T6/T12) + HACKING.md。scan_arp 主线程永不阻塞 >800ms(v3.5.2 最坏 N×800ms)。+13 pending/fast 测试(总 125)。详见 CHANGELOG.md。
-minKernelSU=11485
