@@ -109,29 +109,13 @@ sh $HNC_DIR/bin/tc_manager.sh restore >> $LOG 2>&1
 log "Initial v6 address sync..."
 sh $HNC_DIR/bin/v6_sync.sh sync >> $LOG 2>&1
 
-# ─── 启动 API 服务器 ─────────────────────────────────────────
-API_PORT=$(grep -o '"api_port":[^,}]*' $HNC_DIR/data/config.json | grep -o '[0-9]*')
-API_PORT=${API_PORT:-8080}
-
-# ─── 启动 API 服务器 ─────────────────────────────────────────
-# v3.4.11 P1-11 安全修复:停止默认启动 api/server.sh
+# ─── HTTP API 已废弃 (v3.8.6) ──────────────────────────────────
+# v3.4.11 起就已禁用 api/server.sh 启动(包含 RCE 风险且被 KSU 桥接取代)
+# v3.8.6 彻底从仓库删除 api/server.sh + 692 行死代码
 #
-# 原因:
-#   1) KSU WebView 用 window.ksu.exec() 直接 fork shell,完全不走 HTTP API
-#   2) api/server.sh 在 0.0.0.0:8080 监听,对热点上所有客户端开放
-#   3) 0 认证 + 0 IP 限制 + POST body 字段无格式验证
-#   4) handle_post_limit 把 mac/ip 直接拼到 sh ... mark "$ip" "$mac" 命令里
-#      → 任何连热点的设备发 {"mac":"a\";rm -rf /;\""} 就能 RCE 你的手机
-#   5) "封锁中"的设备依然能打 8080 端口(封锁规则在 mark 之后)
-#
-# api/server.sh 源码留在仓库里,如有需要手动启动:
-#   sh /data/local/hnc/api/server.sh 8080 &
-#
-# log "Starting API server on port $API_PORT..."
-# sh $HNC_DIR/api/server.sh $API_PORT >> $HNC_DIR/logs/api.log 2>&1 &
-# echo $! > $RUN/api.pid
-# log "API server PID: $(cat $RUN/api.pid)"
-log "API server (api/server.sh) disabled for security (v3.4.11 P1-11)"
+# 当前架构:WebUI 通过 KernelSU WebView 的 window.ksu.exec() 直接调用
+# shell 命令,完全不走 HTTP 端口。因此不需要任何 server 进程。
+log "HTTP API removed (v3.8.6); WebUI uses KSU bridge"
 
 # ─── 启动设备检测守护进程（v3.0.0：优先 C daemon hotspotd）─
 # device_detect.sh daemon 内部会优先尝试启动 hotspotd(C)；
@@ -166,8 +150,7 @@ sh $HNC_DIR/bin/watchdog.sh >> $HNC_DIR/logs/watchdog.log 2>&1 &
 echo $! > $RUN/watchdog.pid
 
 log "=== All services started ==="
-log "WebUI available at: http://$(ip addr show $HOTSPOT_IFACE 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -1):$API_PORT"
-log "Or access via: http://192.168.43.1:$API_PORT (default hotspot gateway)"
+log "All services started. WebUI: open KernelSU manager → modules → HNC"
 
 # ─── 热点自动启动 ────────────────────────────────────────────
 # 读取 rules.json 里的 hotspot_auto 字段（WebUI 控制）

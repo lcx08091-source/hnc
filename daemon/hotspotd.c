@@ -912,6 +912,11 @@ static int unix_server_open(void) {
      *
      * 如果未来要让非 root 进程通信,应该显式 chown + chmod 0660,而不是 0666。 */
     chmod(SOCK_PATH, 0600);
+    /* v3.8.6 纵深防御: 显式 chown 到 root:root,即使创建时 umask 异常
+     * 也保证只有 root 能访问。chown 失败不阻塞启动(本来就是 root 跑) */
+    if (chown(SOCK_PATH, 0, 0) != 0) {
+        hlog("WARN: chown SOCK_PATH failed: %s (continuing)", strerror(errno));
+    }
     listen(fd, 8);
     return fd;
 }

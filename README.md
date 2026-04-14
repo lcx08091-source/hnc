@@ -2,10 +2,10 @@
 
 > **Android 手机热点的设备级管控工具** · 限速 · 延迟注入 · 黑白名单 · 自动开热点
 
-![version](https://img.shields.io/badge/version-v3.5.0-purple.svg)
+![version](https://img.shields.io/badge/version-v3.8.6-purple.svg)
 ![platform](https://img.shields.io/badge/platform-Android%2010%E2%80%9316-green.svg)
 ![root](https://img.shields.io/badge/root-KernelSU%20%7C%20SukiSU-orange.svg)
-![tests](https://img.shields.io/badge/tests-97%20passing-brightgreen.svg)
+![tests](https://img.shields.io/badge/tests-268%20passing-brightgreen.svg)
 
 ---
 
@@ -14,13 +14,19 @@
 HNC 是一个 **KernelSU / SukiSU 模块**,让你的手机变成一个**可控的热点路由器**:
 
 - 🚦 **每台设备单独限速**(MB/s 精度,上下行独立)
-- 🌐 **延迟注入**(模拟弱网,游戏 / 直播测试用)
+- 🌐 **延迟注入**(模拟弱网,游戏 / 直播测试用,v3.8.5 修复 RTT 语义)
 - 🚫 **黑白名单封锁**(MAC 级别)
 - 🔄 **开机自动开热点**(SELinux 自动注入,Android 13+ 全机型)
 - 📊 **实时流量统计**(per-device,跨重启持久化)
 - 🎨 **iOS 风格 WebUI**(深色 / 浅色 / 跟随系统三态切换)
-- 🔍 **mDNS 自动设备命名**(自动识别 iPhone / 小米 / 华为等)
-- ⚡ **C 语言事件驱动 daemon**(v3.5+ 加速 50-200 倍,netlink 实时响应)
+- 🔍 **mDNS 自动设备命名**(自动识别 iPhone / 小米 / 华为等,v3.8.4 异步化)
+- ⚡ **C 语言事件驱动 daemon**(netlink 实时响应,pthread 异步 mDNS)
+
+## 架构
+
+- WebUI 通过 **KernelSU WebView 桥接**(`window.ksu.exec`)直接调用 shell 命令,**不开 HTTP 端口**
+- C daemon (`hotspotd`) 通过 unix socket(`/data/local/hnc/run/api.sock`,权限 0600)接受命令
+- 没有任何对外网络服务,不存在 RCE 风险面
 
 ---
 

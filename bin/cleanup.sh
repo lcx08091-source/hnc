@@ -25,7 +25,7 @@ for pidfile in hotspotd watchdog detect api hotspot netmon; do
 done
 
 # 确保相关进程名也被清理
-for proc in device_detect watchdog server.sh hotspot_autostart; do
+for proc in device_detect watchdog hotspot_autostart; do
     pkill -f "$proc" 2>/dev/null && log "pkill $proc"
 done
 

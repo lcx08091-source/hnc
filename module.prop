@@ -1,7 +1,7 @@
 id=hotspot_network_control
 name=Hotspot Network Control
-version=v3.8.5
-versionCode=3805
+version=v3.8.6
+versionCode=3806
 author=Claude (Anthropic AI)
-description=热点设备管控 v3.8.5 · 大 v3.8 阶段 6/6 · netem RTT 语义修复。用户反馈"设置 200ms 延迟,ping 看到 400ms"。根本原因:v3.3.2 以来 set_delay 在 egress(wlan2 下行)和 ingress(ifb0 上行)都加了同样的 netem 延迟,用户心智模型是"ping RTT 增量"但代码是"每方向延迟"。v3.8.5 修复:用户输入的 delay_ms 现在是 RTT 视角,内部除以 2 分给两方向。奇数 egress 向上取整 ingress 向下取整(101→51+50 无精度损失)。实测:设 250ms,ping RTT 从 ~500ms 降到 ~270ms(250 + ~20 base),完美符合预期。jitter 和 loss 保持每方向原值(合并后 RTT jitter ≈ √2 × 单方向,端到端 loss ≈ 2p,精确除法需浮点不值得)。v3.8.5 的语义:delay 是 RTT,jitter/loss 是每方向。改动极小(tc_manager.sh 15 行),但修的是用户每天都能感知的真实 bug,比 WebUI 打磨优先级高。大 v3.8 6/6 阶段完成,HNC 进入稳定维护期。
+description=热点设备管控 v3.8.6 · 死代码清理 + 安全加固 + 文档对齐。两份外部 AI 全面审查发现:1) api/server.sh 是 v3.4.11 起就禁用的死代码 692 行,且包含 RCE 风险源(Python http.server + subprocess.run shell=true)。v3.8.6 彻底从仓库删除,消除认知噪音和潜在隐患。2) WebUI 实际通过 KernelSU WebView 桥接(window.ksu.exec)19 处调用,完全不走 HTTP 端口。修正 README.md 把"HTTP API"的过时描述改成"KSU 桥接"。3) hotspotd unix socket 已经是 0600,加 chown(0,0) 纵深防御。4) README.md 版本号从 v3.5.0 / 97 测试 更新到 v3.8.6 / 268 测试。5) service.sh 移除"WebUI URL: http://192.168.43.1:8080"误导日志。6) cleanup.sh 移除 server.sh 进程清理(已不存在)。改动:删除 api/server.sh + 4 个文件改 ~30 行。无功能变化,纯清理。268 测试全过。这是大 v3.8 真正的收尾,HNC 进入稳定 LTS。
 minKernelSU=11485

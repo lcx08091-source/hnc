@@ -1,8 +1,8 @@
 #!/system/bin/sh
 
-# v3.8.5 alpha-0: PATH 健壮性,见 service.sh
+# v3.8.6 alpha-0: PATH 健壮性,见 service.sh
 [ -z "$HNC_SKIP_PATH_HARDENING" ] && [ -z "$HNC_TEST_MODE" ] && export PATH=/system/bin:/system/xbin:/vendor/bin:$PATH
-# diag.sh — HNC v3.8.5 自检脚本
+# diag.sh — HNC v3.8.6 自检脚本
 #
 # 用法:
 #   sh /data/local/hnc/bin/diag.sh
@@ -35,12 +35,12 @@ fail() { FAIL=$((FAIL+1)); RESULTS="$RESULTS$1|FAIL|$2
 
 [ $JSON_MODE -eq 0 ] && {
     echo ""
-    echo "  HNC v3.8.5 自检"
+    echo "  HNC v3.8.6 自检"
     echo "  ──────────────────────────────────────────────"
 }
 
 # ── [1/14] HNC 安装目录 ──────────────────────────────────
-# v3.8.5 修复:module.prop 在 Magisk/KernelSU 模块目录,
+# v3.8.6 修复:module.prop 在 Magisk/KernelSU 模块目录,
 # 不在 $HNC 运行目录。之前检查 $HNC/module.prop 永远 FAIL,
 # 因为 HNC 从 v3.5 开始就没这个文件(只有 bin/data/logs/run)。
 MODDIR=/data/adb/modules/hotspot_network_control
@@ -175,7 +175,7 @@ else
     warn "SELinux" "无法读取状态"
 fi
 
-# ── [13/14] hotspotd daemon 状态(v3.8.5 重写) ───────────
+# ── [13/14] hotspotd daemon 状态(v3.8.6 重写) ───────────
 # 之前(v3.4.11 时代): hotspotd 是实验功能,默认不启用,
 #   检查 bin/hotspotd 存在 → WARN "LTS 期不应启用"
 # 现在(v3.5+ 时代): hotspotd 是默认 daemon,不存在才奇怪
@@ -191,7 +191,7 @@ else
     warn "hotspotd daemon" "binary 未部署,shell fallback 模式(v3.5+ 不推荐)"
 fi
 
-# ── [14/14] dumpsys network_stack 格式探针(v3.8.5) ───────
+# ── [14/14] dumpsys network_stack 格式探针(v3.8.6) ───────
 # v3.7.0 加入的 DHCP hostname 识别功能,依赖 `dumpsys network_stack` 输出里
 # 同时包含 "hwAddr: " 和 "hostname: " 两个字段。Android mainline 模块没有
 # 稳定的 API 合约,将来 Google 改了输出格式 HNC 会静默失效(WebUI 所有
@@ -228,7 +228,7 @@ fi
 # ── 汇总输出 ────────────────────────────────────────────
 if [ $JSON_MODE -eq 1 ]; then
     # JSON 输出
-    printf '{"version":"v3.8.5","pass":%d,"warn":%d,"fail":%d,"checks":[' "$PASS" "$WARN" "$FAIL"
+    printf '{"version":"v3.8.6","pass":%d,"warn":%d,"fail":%d,"checks":[' "$PASS" "$WARN" "$FAIL"
     FIRST=1
     echo "$RESULTS" | while IFS='|' read -r name status detail; do
         [ -z "$name" ] && continue
