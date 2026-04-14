@@ -54,13 +54,20 @@ jobs:
           ./test_mdns_parse
           # v3.6 Commit 2: test_hostname_helpers 现在 #include ../hnc_helpers.h
           # 需要 link ../hnc_helpers.c 才能解出 hnc_* 符号
+          # v3.8.3 D3: hnc_helpers.c 现在 include oui_override.h,所有测试
+          #            都要 link oui_override.c
           gcc -Wall -Wextra -I .. -o test_hostname_helpers \
-              test_hostname_helpers.c ../hnc_helpers.c
+              test_hostname_helpers.c ../hnc_helpers.c ../oui_override.c
           ./test_hostname_helpers
           # v3.8.1 A3: hostname_cache 单元测试
           gcc -Wall -Wextra -I .. -o test_hostname_cache \
-              test_hostname_cache.c ../hostname_cache.c ../hnc_helpers.c
+              test_hostname_cache.c ../hostname_cache.c ../hnc_helpers.c \
+              ../oui_override.c
           ./test_hostname_cache
+          # v3.8.3 D3: oui_override 单元测试(新增 27 个)
+          gcc -Wall -Wextra -I .. -o test_oui_override \
+              test_oui_override.c ../oui_override.c
+          ./test_oui_override
           # v3.8.2 B3 方案 G: 调用链真代码集成测试
           # 通过 #include "../hotspotd.c" + 同名 static mock 覆盖 I/O 函数,
           # 测试执行的是真实 resolve_hostname 机器码,不是 shim 重实现。
@@ -68,7 +75,8 @@ jobs:
           # HNC_TEST_MODE 下不可用,但 extern 声明会触发未使用警告。
           gcc -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
               -Wno-unused-variable -I .. -o test_call_chain \
-              test_call_chain.c ../hnc_helpers.c ../hostname_cache.c
+              test_call_chain.c ../hnc_helpers.c ../hostname_cache.c \
+              ../oui_override.c
           ./test_call_chain
 
   build:

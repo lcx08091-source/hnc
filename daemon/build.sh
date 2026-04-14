@@ -14,7 +14,8 @@ ARCH=${1:-arm64}
 # v3.6 Commit 2: 编译 hotspotd.c + hnc_helpers.c
 # hnc_helpers.c 包含从 hotspotd.c 提取的纯 helper 函数。
 # v3.8.1 A3: 新增 hostname_cache.c,持久化 DHCP/mDNS 识别结果。
-SRCS="hotspotd.c hnc_helpers.c hostname_cache.c"
+# v3.8.3 D3: 新增 oui_override.c,用户 OUI 覆盖。
+SRCS="hotspotd.c hnc_helpers.c hostname_cache.c oui_override.c"
 OUTDIR=prebuilt/${ARCH}
 OUT=${OUTDIR}/hotspotd
 

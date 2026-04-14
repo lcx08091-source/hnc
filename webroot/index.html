@@ -1430,10 +1430,43 @@ html,body { min-height:100%; background:var(--bg); color:var(--t0); font-family:
         <div class="about-name">HNC · Hotspot Network Control</div>
         <div class="about-author">作者：Claude (Anthropic AI) &nbsp;·&nbsp; KSU / Magisk 模块</div>
       </div>
-      <span class="about-ver">v3.8.2</span>
+      <span class="about-ver">v3.8.3</span>
     </div>
     <!-- 更新日志 -->
     <div class="changelog">
+
+      <!-- v3.8.3 OUI 扩展 + 用户覆盖 -->
+      <div class="cl-item">
+        <div class="cl-left">
+          <div class="cl-dot"></div>
+          <div class="cl-line"></div>
+        </div>
+        <div class="cl-right">
+          <div class="cl-title">🏷️ v3.8.3 OUI 扩展 + 用户覆盖机制 &nbsp;<span style="font-size:11px;color:var(--t2);font-weight:400">2026-04-14</span></div>
+          <div class="cl-tags">
+            <span class="cl-tag feat" style="background:#059669;color:#fff">大 v3.8 阶段 4/6</span>
+            <span class="cl-tag feat">OUI 表扩展</span>
+            <span class="cl-tag feat">用户覆盖</span>
+          </div>
+          <ul class="cl-changes">
+            <li><b>📊 D2' OUI 表扩展 444 → 907 条</b>:新增 465 条常见厂商前缀,按 prefix 升序,bsearch 平均 ~10 次比较。覆盖广度提升一倍,原表偏重手机/PC,新表补上了<b>整个智能家居生态</b></li>
+            <li><b>🌐 覆盖厂商增加</b>:<br>
+              • <b>路由器</b>:TP-Link/Netgear/ASUS/Linksys/D-Link/MikroTik/Ubiquiti<br>
+              • <b>音频</b>:Sonos/Bose/JBL/Harman/Denon/Yamaha<br>
+              • <b>电视家电</b>:LG/Sony/Panasonic/Toshiba/Hisense/TCL/Vizio<br>
+              • <b>打印机</b>:Canon/Epson/Brother + HP 补漏<br>
+              • <b>安防</b>:Ring/Arlo/Wyze/Hikvision/Dahua/Reolink<br>
+              • <b>可穿戴/出行</b>:Garmin/Fitbit/Tesla<br>
+              • <b>游戏</b>:PlayStation/Xbox 补漏<br>
+              • <b>IoT</b>:Shelly/Aqara/Tuya + Espressif 补漏<br>
+              • <b>主流厂商补漏</b>:Apple/Samsung/Xiaomi/Google/Amazon 常见前缀</li>
+            <li><b>🎯 D3 用户 OUI 覆盖</b>:新增 <code>/data/local/hnc/data/oui_overrides.json</code>,格式是简单 JSON <code>{"28:6c:07":"小米手机"}</code>。用户可以给自家设备打精确标签(例如"我的 MacBook"而非"Apple 设备"),或给 LAA 随机 MAC(虚拟机/Docker)命名,或覆盖内置表</li>
+            <li><b>🔑 优先级设计</b>:<code>override > 内置 OUI > LAA 跳过</code>。override 在 LAA 检查**之前**生效,允许用户给虚拟机的 LAA MAC 打标签。内置表查询仍然跳过 LAA(避免伪造厂商识别)</li>
+            <li><b>🧩 实现</b>:新增 <code>daemon/oui_override.{h,c}</code> 独立模块(~350 行),JSON 宽松解析(冒号/横线/大小写/UTF-8 中文全支持),容量 256 条,文件上限 16KB,损坏数据不 crash</li>
+            <li><b>🧪 测试</b>:27 个 oui_override 单元测试 + 全套 237 个测试回归,零编译 warning</li>
+          </ul>
+        </div>
+      </div>
 
       <!-- v3.8.2 调用链真代码集成测试(方案 G) -->
       <div class="cl-item">

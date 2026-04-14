@@ -1,7 +1,7 @@
 id=hotspot_network_control
 name=Hotspot Network Control
-version=v3.8.2
-versionCode=3802
+version=v3.8.3
+versionCode=3803
 author=Claude (Anthropic AI)
-description=热点设备管控 v3.8.2 · 大 v3.8 阶段 3/6 · B3 调用链真代码集成测试(方案 G: Include + 同名 static 覆盖)。hotspotd.c 底部把 try_mdns_resolve / try_ns_dhcp_resolve / main 三段用 #ifndef HNC_TEST_MODE 包围,前向声明保留在原位置。test_call_chain.c 通过 #include "../hotspotd.c" 加载真代码,自己提供同名 static mock 替换 I/O 函数。测试执行的是 100% 真实的 resolve_hostname 机器码,零 shim 零 drift。27 个真代码集成测试全过(含 v3.7.0 坑 16 + v3.7.2 坑 18 回归保护)。方案选择经历了 E(契约测试,反模式)→ F(--wrap,smoke test 失败)→ G(include + 静态覆盖,成功)三次迭代,每步用 smoke test 验证。生产 hotspotd 符号表和 v3.8.1 完全一致,行为零变化。210 个测试全过。
+description=热点设备管控 v3.8.3 · 大 v3.8 阶段 4/6 · D2'+D3 OUI 扩展与覆盖。D2': OUI 表从 444 条扩展到 907 条,新增广覆盖厂商(TP-Link/Netgear/ASUS/Linksys/D-Link/MikroTik/Ubiquiti 路由器、IKEA/Philips/Sonos/Bose/JBL/Denon/Yamaha 音频、LG/Sony/Panasonic/Toshiba/Hisense/TCL/Vizio 电视、Canon/Epson/Brother 打印机、Hikvision/Dahua/Ring/Arlo/Wyze/Reolink 摄像头、Garmin/Fitbit 可穿戴、Tesla 汽车、PlayStation/Xbox 游戏机、Shelly/Aqara/Tuya IoT、Apple/Samsung/Xiaomi/Google/Amazon/Espressif 主流厂商补漏)。D3: 新增用户 OUI 覆盖机制,文件 /data/local/hnc/data/oui_overrides.json 优先级最高,允许用户给特定 MAC 前缀打精确标签("小米手机"而非"Xiaomi 设备"),支持 LAA MAC(虚拟机/Docker 容器)。两个功能结合 = 更广的内置厂商覆盖 + 用户可精准定制。237 个测试全过。
 minKernelSU=11485

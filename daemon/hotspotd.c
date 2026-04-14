@@ -55,6 +55,7 @@
  * 彻底消除复制 drift。 */
 #include "hnc_helpers.h"
 #include "hostname_cache.h"  /* v3.8.1: DHCP/mDNS hostname 持久化 cache */
+#include "oui_override.h"    /* v3.8.3 D3: 用户 OUI 覆盖 */
 
 /* 兼容性宏：部分 libc/内核头文件版本不导出 NDM_RTA/NDM_PAYLOAD */
 #ifndef NDM_RTA
@@ -78,6 +79,7 @@
 #define RULES_JSON          HNC_DIR "/data/rules.json"
 #define DEVICE_NAMES_JSON   HNC_DIR "/data/device_names.json"   /* v3.5.0 P0-4 */
 #define HOSTNAME_CACHE_JSON HNC_DIR "/data/hostname_cache.json" /* v3.8.1 A3 */
+#define OUI_OVERRIDE_JSON   HNC_DIR "/data/oui_overrides.json"  /* v3.8.3 D3 */
 #define MDNS_RESOLVE_BIN    HNC_DIR "/bin/mdns_resolve"         /* v3.5.0 P0-4 */
 #define IPTABLES_MGR        HNC_DIR "/bin/iptables_manager.sh"  /* v3.5.1 P1-2 */
 
@@ -1381,6 +1383,15 @@ int main(int argc, char *argv[]) {
     int cache_loaded = hnc_cache_load();
     hlog("hostname cache: loaded %d entries from %s",
          cache_loaded, HOSTNAME_CACHE_JSON);
+
+    /* v3.8.3 D3: 加载用户 OUI 覆盖表
+     * 如果文件不存在(用户没写过)load 返回 0,正常。
+     * 如果加载成功,覆盖表会在 hnc_lookup_oui 的最前面生效,
+     * 允许用户给特定前缀打精确标签或覆盖内置表。*/
+    hnc_override_init(OUI_OVERRIDE_JSON);
+    int override_loaded = hnc_override_load();
+    hlog("oui override: loaded %d entries from %s",
+         override_loaded, OUI_OVERRIDE_JSON);
 
     /* 初始扫描 */
     scan_arp();

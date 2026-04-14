@@ -1155,7 +1155,15 @@ echo "PING" | nc -U /data/local/hnc/run/hotspotd.sock
 - **v3.5.0**: 测试框架 + CI + hotspotd C daemon ❌ DEPRECATED(4 个 P0)
 - **v3.5.1**: 显性功能正确性 ❌ DEPRECATED(P0-A 架构 race)
 - **v3.5.2**: daemon 生命周期架构成熟(三层防御 + helpers 分离)✅ Released
-- **v3.6.0**: 技术债清理 + helpers 提取 + scan_arp pending 异步 ✅ (当前)
+- **v3.6.0**: 技术债清理 + helpers 提取 + scan_arp pending 异步 ✅
+- **v3.6.3**: Gemini 审查 P1 修复 ✅
+- **v3.7.0**: DHCP hostname(dumpsys network_stack)✅,但坑 16 导致 v3.7.1
+- **v3.7.1**: pending 路径 DHCP 修复(坑 16 对策)✅
+- **v3.7.2**: Gemini 发现的 5 个 P0(含真 RCE:fork+execlp 重写)✅
+- **v3.8.0**: OUI 查表 444 条 + dumpsys 格式探针 + 坑 14-20 + AI 审查流程 ✅
+- **v3.8.1**: hostname cache 持久化 + diag.sh 假警报修复 ✅
+- **v3.8.2**: 调用链真代码集成测试(方案 G: include + 同名 static 覆盖)✅
+- **v3.8.3**: OUI 表 444→907 条(+广覆盖厂商)+ 用户 OUI 覆盖机制 ✅ (当前)
 
 **v3.5.0 → v3.5.2 是 "发三次被 AI 审查毙两次" 的历史**。看 CHANGELOG 的 v3.5.x 段能学到:
 - 真 P0 长什么样
