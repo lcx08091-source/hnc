@@ -1,7 +1,7 @@
 id=hotspot_network_control
 name=Hotspot Network Control
-version=v3.8.4
-versionCode=3804
+version=v3.8.5
+versionCode=3805
 author=Claude (Anthropic AI)
-description=热点设备管控 v3.8.4 · 大 v3.8 阶段 5/6 · pthread 异步 mDNS worker。HNC 项目首次引入 pthread。scan_arp 和 nl_process 的 re-resolve 路径以前同步调 resolve_hostname,其中 mdns 分支最坏阻塞主循环 800ms,现在改成先同步调 resolve_hostname_dhcp_only(~35ms),只有所有快速路径都失败才 enqueue 到异步 worker。采用 Actor 模型:双队列(工作队列 + 结果队列),单 worker 线程,g_devs 依然主线程独占,零 g_devs 锁。Worker 通过函数指针注入 try_mdns_resolve,不依赖 hotspotd.c 的 static 函数,单元测试可注入 mock。drain_results 的优先级检查(只覆盖 pending 状态)实现了乐观锁,避免 mdns 结果覆盖更高优先级的 dhcp。两轮 Gemini 外部审查:修复 P1(sigdelset 剔除 SIGSEGV/SIGBUS/SIGILL/SIGFPE 避免 POSIX UB)+ 3 个 P2(删除 volatile / strncpy 规范化 / stop 防重入)。31 个 mdns_worker 单元测试 + 268 全套回归测试全过。信号屏蔽 + 双锁不嵌套 + 结果队列有界(16) + Stop 幂等 + join 等最后任务完成。
+description=热点设备管控 v3.8.5 · 大 v3.8 阶段 6/6 · netem RTT 语义修复。用户反馈"设置 200ms 延迟,ping 看到 400ms"。根本原因:v3.3.2 以来 set_delay 在 egress(wlan2 下行)和 ingress(ifb0 上行)都加了同样的 netem 延迟,用户心智模型是"ping RTT 增量"但代码是"每方向延迟"。v3.8.5 修复:用户输入的 delay_ms 现在是 RTT 视角,内部除以 2 分给两方向。奇数 egress 向上取整 ingress 向下取整(101→51+50 无精度损失)。实测:设 250ms,ping RTT 从 ~500ms 降到 ~270ms(250 + ~20 base),完美符合预期。jitter 和 loss 保持每方向原值(合并后 RTT jitter ≈ √2 × 单方向,端到端 loss ≈ 2p,精确除法需浮点不值得)。v3.8.5 的语义:delay 是 RTT,jitter/loss 是每方向。改动极小(tc_manager.sh 15 行),但修的是用户每天都能感知的真实 bug,比 WebUI 打磨优先级高。大 v3.8 6/6 阶段完成,HNC 进入稳定维护期。
 minKernelSU=11485

@@ -1430,10 +1430,35 @@ html,body { min-height:100%; background:var(--bg); color:var(--t0); font-family:
         <div class="about-name">HNC · Hotspot Network Control</div>
         <div class="about-author">作者：Claude (Anthropic AI) &nbsp;·&nbsp; KSU / Magisk 模块</div>
       </div>
-      <span class="about-ver">v3.8.4</span>
+      <span class="about-ver">v3.8.5</span>
     </div>
     <!-- 更新日志 -->
     <div class="changelog">
+
+      <!-- v3.8.5 netem RTT 语义修复 -->
+      <div class="cl-item">
+        <div class="cl-left">
+          <div class="cl-dot"></div>
+          <div class="cl-line"></div>
+        </div>
+        <div class="cl-right">
+          <div class="cl-title">⏱️ v3.8.5 netem RTT 语义修复 &nbsp;<span style="font-size:11px;color:var(--t2);font-weight:400">2026-04-14</span></div>
+          <div class="cl-tags">
+            <span class="cl-tag feat" style="background:#059669;color:#fff">大 v3.8 阶段 6/6</span>
+            <span class="cl-tag feat">语义修复</span>
+            <span class="cl-tag feat">用户痛点</span>
+          </div>
+          <ul class="cl-changes">
+            <li><b>🐛 用户痛点</b>:反馈"设 200ms 延迟,ping 看到 400ms 翻倍"。排查确认 v3.3.2 以来 set_delay 在 egress(wlan2 下行)和 ingress(ifb0 上行)都加同样的 netem 延迟,代码日志明确写 <code>(both dirs)</code>。这是<b>作者意图 vs 用户直觉的语义冲突</b>,不是 bug:作者想做"真实对称弱网模拟",用户想的是"ping RTT 增量"</li>
+            <li><b>🔬 实测验证</b>:设 250ms,临时手动把两方向 netem 各改成 125ms,ping 从 <code>490/503/514</code> ms 降到 <code>253/270/281</code> ms。270ms = 250ms(设置)+ ~20ms(基础 RTT)。完美符合用户预期</li>
+            <li><b>✅ 修复方案(方案 3)</b>:用户输入的 delay_ms 现在是<b>RTT 视角</b>,内部除以 2 分给两方向。奇数 egress 向上取整 ingress 向下取整:<code>101 → 51 + 50</code>(总和 = 101,无精度损失)。保留 v3.3.2 的双向 netem 设计(真实对称模拟),只改数学</li>
+            <li><b>🧮 jitter/loss 的处理</b>:保持每方向原值。理论上双向 jitter 合并后 RTT jitter ≈ √2 × 单方向,端到端 loss ≈ 2p,要精确除需浮点运算,shell 里不划算。所以 v3.8.5 明确语义:<b>delay 是 RTT,jitter/loss 是每方向</b>。实际使用中,用户主要关心 delay,jitter 只是锦上添花</li>
+            <li><b>🗺️ 改动极小</b>:只改 <code>bin/tc_manager.sh</code> 的 set_delay 函数(~15 行),加两个局部变量 delay_eg/delay_ig 做整数除 2。log 格式更新为 <code>RTT=250ms (eg 125ms + ig 125ms)</code> 让排查更直观</li>
+            <li><b>🧪 测试</b>:64 shell 测试 + 268 C 测试全过。test_iptables_tc.sh 的 set_delay mock 测试不检查具体参数,所以除以 2 的语义改动对测试透明</li>
+            <li><b>🎯 大 v3.8 完成</b>:6/6 阶段全部完成。v3.8.0 OUI / v3.8.1 cache / v3.8.2 方案 G / v3.8.3 OUI 扩展 / v3.8.4 pthread / v3.8.5 RTT 语义。HNC 进入稳定维护期</li>
+          </ul>
+        </div>
+      </div>
 
       <!-- v3.8.4 pthread 异步 mDNS worker -->
       <div class="cl-item">

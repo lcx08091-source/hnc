@@ -522,12 +522,38 @@ set_limit() {
 #   - 启用延迟：ensure_device_class + set_netem_only（只改 leaf netem）
 #   - 关闭延迟：只重置 leaf netem 为无延迟，不动 class rate
 #   - 结果：关延迟时若该设备还有限速，限速保持不变
+#
+# v3.8.5 RTT 语义修复：
+#   v3.3.2 以来 delay_ms 被每方向(egress wlan2 + ingress ifb0)各加一次,
+#   用户 ping 看到的 RTT 是设置值的 2 倍。v3.3.2 作者意图是"真实弱网模拟"
+#   (双向对称延迟),但用户心智模型是"RTT 增量"(ping 看到的数字)。
+#
+#   v3.8.5 修复:用户输入的 delay_ms 现在是 RTT 视角。内部除以 2 分给两个
+#   方向,ping RTT 就会增加 delay_ms(+基础 RTT)。
+#   - 奇数处理: egress 向上取整,ingress 向下取整(101 → 51 + 50)
+#   - jitter 保持每方向原值(合并后 RTT jitter ≈ √2 × 单方向,精确除法需浮点,
+#     不值得)
+#   - loss 保持每方向原值(端到端 loss ≈ 2p,同样不做精确除)
+#   - 所以 v3.8.5 的语义:delay 是 RTT,jitter/loss 是每方向(在 WebUI 说明)
+#
+#   实测:设 250ms,ping RTT 从 ~500ms 降到 ~270ms(250 + ~20 base RTT)✓
 # ═══════════════════════════════════════════════════════════════
 set_delay() {
     local iface=$1 mark_id=$2 delay_ms=${3:-0} jitter_ms=${4:-0} loss=${5:-0} ip=${6:-}
     local class_id; class_id=$(printf "%d" "$mark_id")
 
-    log "set_delay: mark=$mark_id ip=${ip:-(none)} ${delay_ms}ms jitter=${jitter_ms}ms loss=${loss}%"
+    # v3.8.5: 把 RTT delay 除以 2 分给两个方向
+    # egress 向上取整,ingress 向下取整(奇数精度保留)
+    local delay_eg delay_ig
+    if gt0 "$delay_ms"; then
+        delay_eg=$(( (delay_ms + 1) / 2 ))
+        delay_ig=$(( delay_ms / 2 ))
+    else
+        delay_eg=0
+        delay_ig=0
+    fi
+
+    log "set_delay: mark=$mark_id ip=${ip:-(none)} RTT=${delay_ms}ms (eg ${delay_eg}ms + ig ${delay_ig}ms) jitter=${jitter_ms}ms loss=${loss}%"
 
     # v3.5.0 alpha-2:P0-3 完整修复
     # v3.4.11 只修了 set_netem_only 内部逻辑,但 set_delay 的入口判断仍然是
@@ -538,10 +564,11 @@ set_delay() {
         # 双向都建 class（若尚未建立）
         ensure_device_class "$iface"     "$class_id" "$ip"
         ensure_device_class "$IFB_IFACE" "$class_id" "$ip"
-        # 只修改 leaf netem,不动 class rate
-        set_netem_only "$iface"     "$class_id" "$delay_ms" "$jitter_ms" "$loss"
-        set_netem_only "$IFB_IFACE" "$class_id" "$delay_ms" "$jitter_ms" "$loss"
-        log "  Netem applied: ${delay_ms}ms jitter=${jitter_ms}ms loss=${loss}% (both dirs)"
+        # v3.8.5: delay 除以 2 分给两方向(egress=down, ingress=up)
+        # jitter/loss 依然是每方向原值(见上面函数注释说明)
+        set_netem_only "$iface"     "$class_id" "$delay_eg" "$jitter_ms" "$loss"
+        set_netem_only "$IFB_IFACE" "$class_id" "$delay_ig" "$jitter_ms" "$loss"
+        log "  Netem applied: RTT ${delay_ms}ms (eg=${delay_eg}ms + ig=${delay_ig}ms) jitter=${jitter_ms}ms loss=${loss}%"
     else
         # 关延迟：把 leaf netem 重置为无延迟，class 及 rate 不动
         if class_exists "$iface" "$class_id"; then

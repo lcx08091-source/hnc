@@ -938,6 +938,77 @@ HNC 的测试策略 v3.8 之后从"单元覆盖"升级为"调用链覆盖"。
 
 ---
 
+### 坑 21: netem delay 的"作者意图 vs 用户直觉"语义冲突
+
+**教训版本**: v3.3.2 (2025-10) 埋下,v3.8.5 (2026-04) 修复 — **存在 6 个月**
+
+**背景**: v3.3.2 重构 set_delay 时,作者(过去的自己)写了:
+
+```sh
+set_netem_only "$iface"     "$class_id" "$delay_ms" ...  # wlan2 egress
+set_netem_only "$IFB_IFACE" "$class_id" "$delay_ms" ...  # ifb0 ingress
+log "  Netem applied: ${delay_ms}ms ... (both dirs)"
+```
+
+作者的心智模型是"**真实对称弱网模拟**":双向各加 delay_ms,更接近真实
+蜂窝网络的表现。log 里明确写了 `(both dirs)`。
+
+但是用户的心智模型是"**ping RTT 增量**":我设 200ms,ping 看到的 RTT
+应该比不设时涨 200ms。用户根本不知道 "both dirs" 意味着 RTT 翻倍。
+
+**症状**: 用户设 200ms,ping 看 400ms。用户设 250ms,ping 看 500ms。
+永远是两倍,"好像 bug 了"。
+
+**排查路径**:
+1. 用户反馈"延迟翻倍" — 模糊的症状
+2. Claude 写 hnc_delay_debug.sh 脚本读 tc 状态
+3. `tc qdisc show` 显示 wlan2 和 ifb0 **都**有 netem delay 200ms
+4. 临时手动 `tc qdisc change` 把两方向各改成 125ms
+5. ping RTT 从 503 降到 270 — 验证"除以 2 分给两方向"是对的
+6. grep tc_manager.sh 找到 set_delay 的源码,确认是 v3.3.2 的刻意设计
+
+**修复** (v3.8.5):
+
+```sh
+# 用户输入的 delay_ms 现在是 RTT 视角,内部除以 2 分给两方向
+local delay_eg delay_ig
+if gt0 "$delay_ms"; then
+    delay_eg=$(( (delay_ms + 1) / 2 ))  # egress 向上取整
+    delay_ig=$(( delay_ms / 2 ))         # ingress 向下取整
+fi
+set_netem_only "$iface"     "$class_id" "$delay_eg" "$jitter_ms" "$loss"
+set_netem_only "$IFB_IFACE" "$class_id" "$delay_ig" "$jitter_ms" "$loss"
+```
+
+奇数精度保留:101 → 51 + 50(总和 101,无损失)。
+
+**元教训 A**: **技术正确 ≠ 用户可理解**。v3.3.2 的"对称双向 netem"技术上
+更真实,但用户根本感知不到"真实"的价值,只感知到"数字对不上"。优先满足
+用户的心智模型,而不是技术的理论优雅。
+
+**元教训 B**: **log 里的提示"(both dirs)"只有代码作者能看懂**。普通
+用户看 log 不知道 "both dirs" 意味着 RTT 翻倍。如果这个提示写成
+"delay applied to both egress and ingress, RTT will increase by 2x"
+就不会出问题。**技术术语要翻译成用户能理解的后果**。
+
+**元教训 C**: **jitter 和 loss 的双向数学不简单**。作者的第一反应是"那
+jitter 也除以 2",但:
+- jitter 是独立随机源,合并后 RTT jitter ≈ √2 × 单方向(不是 2×)
+- loss 是百分比,端到端 loss ≈ 2p(小 p 时),精确反算要 `p = 1-√(1-target)`
+
+两者都需要浮点运算,在 shell 里不划算。**v3.8.5 的决策是:只修 delay,
+jitter/loss 保持每方向语义,在 WebUI 上明确标注**。这是务实的妥协,
+避免把简单的修复变成复杂的数学项目。
+
+**元教训 D**: **长期遗留的"作者意图问题"只有用户反馈才能暴露**。v3.3.2
+到 v3.8.4,6 个月内所有版本都有这个问题,所有测试都过,所有 CI 都绿。
+因为**测试只测了代码符合作者意图,没测代码符合用户直觉**。真正暴露问题
+的是用户的一句话"好像翻倍了"。
+
+**用户反馈是最好的测试集**,没有之一。
+
+---
+
 ## 🛡️ AI 审查流程(v3.7.2 之后的标准步骤)
 
 HNC 项目每次 **P0 级改动** 发布前**必须**经过外部 AI 审查。
