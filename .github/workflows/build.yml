@@ -117,12 +117,14 @@ jobs:
         run: |
           # v3.6 Commit 2: 编译 hotspotd.c + hnc_helpers.c
           # v3.8.1 A3: 新增 hostname_cache.c 持久化 DHCP/mDNS 识别结果
+          # v3.8.3 D3: 新增 oui_override.c 用户 OUI 覆盖
           $CC \
             -O2 \
             -Wall -Wextra -Wno-unused-parameter \
             -static \
             -o bin/hotspotd \
-            daemon/hotspotd.c daemon/hnc_helpers.c daemon/hostname_cache.c
+            daemon/hotspotd.c daemon/hnc_helpers.c \
+            daemon/hostname_cache.c daemon/oui_override.c
           $STRIP bin/hotspotd
           file bin/hotspotd
           ls -lh bin/hotspotd
