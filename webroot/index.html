@@ -1430,10 +1430,35 @@ html,body { min-height:100%; background:var(--bg); color:var(--t0); font-family:
         <div class="about-name">HNC · Hotspot Network Control</div>
         <div class="about-author">作者：Claude (Anthropic AI) &nbsp;·&nbsp; KSU / Magisk 模块</div>
       </div>
-      <span class="about-ver">v3.8.3</span>
+      <span class="about-ver">v3.8.4</span>
     </div>
     <!-- 更新日志 -->
     <div class="changelog">
+
+      <!-- v3.8.4 pthread 异步 mDNS worker -->
+      <div class="cl-item">
+        <div class="cl-left">
+          <div class="cl-dot"></div>
+          <div class="cl-line"></div>
+        </div>
+        <div class="cl-right">
+          <div class="cl-title">🧵 v3.8.4 pthread 异步 mDNS worker &nbsp;<span style="font-size:11px;color:var(--t2);font-weight:400">2026-04-14</span></div>
+          <div class="cl-tags">
+            <span class="cl-tag feat" style="background:#059669;color:#fff">大 v3.8 阶段 5/6</span>
+            <span class="cl-tag feat">pthread 首次</span>
+            <span class="cl-tag feat">Actor 模型</span>
+          </div>
+          <ul class="cl-changes">
+            <li><b>🧵 HNC 项目首次引入 pthread</b>:scan_arp 和 nl_process 的 re-resolve 路径以前同步调 resolve_hostname,mdns 分支最坏阻塞主循环 800ms。现在先同步调 resolve_hostname_dhcp_only(~35ms),只有所有快速路径都失败才 enqueue 到异步 worker 线程</li>
+            <li><b>🏗️ Actor 模型</b>:双队列 + 单 worker,<b>g_devs 依然主线程独占,零 g_devs 锁</b>。避免了多线程重构的最大风险。新代码集中在 <code>mdns_worker.{h,c}</code> ~360 行,hotspotd.c 只改 7 处</li>
+            <li><b>🔐 乐观锁 drain_results</b>:<code>if (hostname_src != "pending") continue;</code> 这个单行检查实现了乐观并发控制。worker 查询期间 DHCP 抢先命中,mdns 结果会被自动丢弃,尊重 dhcp > mdns 优先级</li>
+            <li><b>🧪 2 轮 Gemini 审查 + 自我审查</b>:自我审查发现信号屏蔽缺失。Gemini 找出 1 个 P1(POSIX UB: sigfillset 屏蔽 SIGSEGV/SIGBUS/SIGILL/SIGFPE 行为未定义,必须 sigdelset 剔除)+ 3 个 P2(删除 volatile / strncpy 规范化 / stop 防重入)全部修复</li>
+            <li><b>🔧 函数指针注入</b>:worker 通过 <code>set_resolve_fn(try_mdns_resolve)</code> 注入,<code>mdns_worker.c</code> 不依赖 hotspotd.c,单元测试可注入 mock</li>
+            <li><b>🛡️ 线程安全</b>:两个独立 mutex(task / result)不嵌套 → 零死锁。异步信号屏蔽只投递主线程,同步信号(段错误)依然触发 tombstone。Stop 幂等 + pthread_join 等最后任务完成</li>
+            <li><b>🧪 测试</b>:31 个 mdns_worker 单元测试 + 268 全套回归全过,零编译 warning</li>
+          </ul>
+        </div>
+      </div>
 
       <!-- v3.8.3 OUI 扩展 + 用户覆盖 -->
       <div class="cl-item">

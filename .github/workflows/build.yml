@@ -68,15 +68,21 @@ jobs:
           gcc -Wall -Wextra -I .. -o test_oui_override \
               test_oui_override.c ../oui_override.c
           ./test_oui_override
+          # v3.8.4: mdns_worker 单元测试(异步 mDNS worker,需要 -pthread)
+          gcc -Wall -Wextra -pthread -I .. -o test_mdns_worker \
+              test_mdns_worker.c ../mdns_worker.c
+          ./test_mdns_worker
           # v3.8.2 B3 方案 G: 调用链真代码集成测试
           # 通过 #include "../hotspotd.c" + 同名 static mock 覆盖 I/O 函数,
           # 测试执行的是真实 resolve_hostname 机器码,不是 shim 重实现。
           # -Wno-unused-{function,variable}: hotspotd.c 里 main/nl_fd 等在
           # HNC_TEST_MODE 下不可用,但 extern 声明会触发未使用警告。
+          # v3.8.4: hotspotd.c 现在 include mdns_worker.h,需要 link
+          #         mdns_worker.c 和 -pthread
           gcc -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
-              -Wno-unused-variable -I .. -o test_call_chain \
+              -Wno-unused-variable -pthread -I .. -o test_call_chain \
               test_call_chain.c ../hnc_helpers.c ../hostname_cache.c \
-              ../oui_override.c
+              ../oui_override.c ../mdns_worker.c
           ./test_call_chain
 
   build:
@@ -118,13 +124,16 @@ jobs:
           # v3.6 Commit 2: 编译 hotspotd.c + hnc_helpers.c
           # v3.8.1 A3: 新增 hostname_cache.c 持久化 DHCP/mDNS 识别结果
           # v3.8.3 D3: 新增 oui_override.c 用户 OUI 覆盖
+          # v3.8.4: 新增 mdns_worker.c 异步 mDNS worker,需要 -pthread
           $CC \
             -O2 \
             -Wall -Wextra -Wno-unused-parameter \
             -static \
+            -pthread \
             -o bin/hotspotd \
             daemon/hotspotd.c daemon/hnc_helpers.c \
-            daemon/hostname_cache.c daemon/oui_override.c
+            daemon/hostname_cache.c daemon/oui_override.c \
+            daemon/mdns_worker.c
           $STRIP bin/hotspotd
           file bin/hotspotd
           ls -lh bin/hotspotd

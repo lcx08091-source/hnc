@@ -15,7 +15,8 @@ ARCH=${1:-arm64}
 # hnc_helpers.c 包含从 hotspotd.c 提取的纯 helper 函数。
 # v3.8.1 A3: 新增 hostname_cache.c,持久化 DHCP/mDNS 识别结果。
 # v3.8.3 D3: 新增 oui_override.c,用户 OUI 覆盖。
-SRCS="hotspotd.c hnc_helpers.c hostname_cache.c oui_override.c"
+# v3.8.4: 新增 mdns_worker.c,异步 mDNS worker(需要 -pthread 链接 libpthread)。
+SRCS="hotspotd.c hnc_helpers.c hostname_cache.c oui_override.c mdns_worker.c"
 OUTDIR=prebuilt/${ARCH}
 OUT=${OUTDIR}/hotspotd
 
@@ -54,6 +55,7 @@ $CC \
     -D_GNU_SOURCE \
     -DANDROID \
     -fPIE -pie \
+    -pthread \
     -o "$OUT" \
     $SRCS
 
@@ -70,5 +72,5 @@ echo "[build] Copied to $BINDIR/hotspotd"
 echo ""
 echo "=== Host build (for syntax check only) ==="
 HOST_OUT=${OUTDIR}/hotspotd_host
-gcc -O0 -std=c11 -Wall -D_GNU_SOURCE -o "$HOST_OUT" $SRCS 2>&1 || true
+gcc -O0 -std=c11 -Wall -D_GNU_SOURCE -pthread -o "$HOST_OUT" $SRCS 2>&1 || true
 [ -f "$HOST_OUT" ] && echo "Host build: OK" || echo "Host build: skipped (different libc)"

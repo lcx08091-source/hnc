@@ -56,6 +56,7 @@
 #include "hnc_helpers.h"
 #include "hostname_cache.h"  /* v3.8.1: DHCP/mDNS hostname 持久化 cache */
 #include "oui_override.h"    /* v3.8.3 D3: 用户 OUI 覆盖 */
+#include "mdns_worker.h"     /* v3.8.4: 异步 mDNS worker (re-resolve 路径) */
 
 /* 兼容性宏：部分 libc/内核头文件版本不导出 NDM_RTA/NDM_PAYLOAD */
 #ifndef NDM_RTA
@@ -242,7 +243,14 @@ static int try_ns_dhcp_resolve(const char *mac,
  *
  * v3.7.0: 加 dhcp(dumpsys network_stack)查询,放在 manual 之后 mdns 之前。
  * DHCP 是被动数据(客户端 DHCP 包里带的 option 12),零网络成本,35ms 完成。
- * 相比 mdns 的 800ms,优先级更高。 */
+ * 相比 mdns 的 800ms,优先级更高。
+ *
+ * v3.8.4: 生产代码不再调用这个函数(scan_arp 和 nl_process 改成
+ * resolve_hostname_dhcp_only + 异步 mdns worker)。但保留函数定义,因为:
+ *   1. test_call_chain.c (方案 G) 的 Section 1 测试依然调用它测试完整 6 级优先链
+ *   2. 作为 "完整优先级链的规范文档" 有文档价值
+ * 加 __attribute__((unused)) 避免 -Wunused-function warning。*/
+__attribute__((unused))
 static void resolve_hostname(const char *mac, const char *ip,
                              char *out_hn, size_t hn_len,
                              char *out_src, size_t src_len) {
@@ -603,13 +611,33 @@ static void scan_arp(void) {
             }
         } else if (hnc_should_re_resolve(d->hostname_src, d->last_resolve, now_t)) {
             /* v3.5.0-rc R-2 + v3.5.2 P1-A:
-             * re-resolve 条件(hostname_src=="mac" 或窗口过期)还是调完整的
-             * resolve_hostname,因为这是已知设备的 re-resolve,不那么延迟敏感,
-             * 也不在主线程的"一批新设备上线"瓶颈路径上。 */
-            resolve_hostname(mac, ip,
-                             d->hostname, sizeof(d->hostname),
-                             d->hostname_src, sizeof(d->hostname_src));
+             * re-resolve 条件(hostname_src=="mac" 或窗口过期)以前调完整的
+             * resolve_hostname,其中 mdns 分支最坏阻塞 800ms。
+             *
+             * v3.8.4: 分两步
+             *   1. 先同步调 dhcp_only(只查 manual/dhcp/cache/oui/mac,~35ms),
+             *      大部分情况下 dhcp 或 cache 命中,直接返回真名
+             *   2. 只有 dhcp_only 返回 src=="mac"(所有快速路径都失败)时,
+             *      才 enqueue 到异步 worker 查 mdns
+             *   3. Worker 结果在主循环下一个 tick 通过 drain_results 写回
+             *
+             * 这样 mdns 查询完全不阻塞 scan_arp,但绝大多数设备(有 DHCP hostname 或
+             * cache 记录的)依然是同步解析,延迟不变。*/
+            resolve_hostname_dhcp_only(mac,
+                                       d->hostname, sizeof(d->hostname),
+                                       d->hostname_src, sizeof(d->hostname_src));
             d->last_resolve = now_t;
+
+            /* 如果 dhcp_only 最终落到 mac 兜底且有 IP,enqueue 异步 mdns 查询 */
+            if (strcmp(d->hostname_src, "mac") == 0 && ip[0] != '\0') {
+                if (hnc_mdns_worker_enqueue(mac, ip)) {
+                    /* 成功入队,标记为 pending-mdns 让 UI 显示"正在查询" */
+                    strncpy(d->hostname_src, "pending", sizeof(d->hostname_src)-1);
+                    d->hostname_src[sizeof(d->hostname_src)-1] = '\0';
+                    d->pending_since = now_t;
+                }
+                /* 队列满则保持 mac 兜底,下轮 re-resolve 会再试 */
+            }
         }
         strncpy(d->ip,    ip,    sizeof(d->ip)-1);
         strncpy(d->iface, iface, sizeof(d->iface)-1);
@@ -823,11 +851,22 @@ static void nl_process(int fd) {
                     d->pending_since = now_t;
                 }
             } else if (hnc_should_re_resolve(d->hostname_src, d->last_resolve, now_t)) {
-                /* v3.5.0-rc R-2 + v3.5.2 P1-A: 已知设备的 re-resolve,同步路径 OK */
-                resolve_hostname(mac_str, ip_str,
-                                 d->hostname, sizeof(d->hostname),
-                                 d->hostname_src, sizeof(d->hostname_src));
+                /* v3.5.0-rc R-2 + v3.5.2 P1-A: 已知设备的 re-resolve。
+                 * v3.8.4: netlink 路径绝对不能阻塞 800ms (ENOBUFS 风险),
+                 *         和 scan_arp 同策略:先同步 dhcp_only,mac 兜底
+                 *         则 enqueue 异步 mdns worker。*/
+                resolve_hostname_dhcp_only(mac_str,
+                                           d->hostname, sizeof(d->hostname),
+                                           d->hostname_src, sizeof(d->hostname_src));
                 d->last_resolve = now_t;
+
+                if (strcmp(d->hostname_src, "mac") == 0 && ip_str[0] != '\0') {
+                    if (hnc_mdns_worker_enqueue(mac_str, ip_str)) {
+                        strncpy(d->hostname_src, "pending", sizeof(d->hostname_src)-1);
+                        d->hostname_src[sizeof(d->hostname_src)-1] = '\0';
+                        d->pending_since = now_t;
+                    }
+                }
             }
             strncpy(d->ip,    ip_str, sizeof(d->ip)-1);
             strncpy(d->iface, iface,  sizeof(d->iface)-1);
@@ -1066,7 +1105,28 @@ static int try_mdns_resolve(const char *ip, const char *mac, char *out, size_t o
         }
     }
     int rc = pclose(pf);
-    (void)rc;
+
+    /* v3.8.4 Gemini/第三方 AI 审查 P2: 检查 pclose 返回值
+     *
+     * 以前这里用 `(void)rc;` 忽略退出状态,只看 fgets 是否读到内容。
+     * 潜在问题:如果 mdns_resolve 被 SIGKILL 或 crash,可能在死前部分
+     * 写了 stdout(buffered),fgets 读到残缺内容,误判为成功。
+     *
+     * 正确做法:mdns_resolve 正常完成必须 exit 0。非零退出 → 查询失败,
+     * 即使有输出也不可信。
+     *
+     * pclose 返回值:
+     *   -1:   pclose 本身失败(waitpid 错误)
+     *   0:    子进程 exit 0,正常
+     *   非零: 子进程 exit 非零,或被信号杀死,异常
+     *
+     * 注意:v3.8.4 这个调用可能发生在 worker 线程里。worker 的信号
+     * mask 屏蔽了异步信号(除 SIGSEGV/SIGBUS/SIGILL/SIGFPE),所以
+     * SIGCHLD 会投递到主线程,pclose 里的 waitpid 不会误认为被中断。*/
+    if (rc != 0) {
+        out[0] = '\0';
+        return 0;
+    }
     return (out[0] != '\0') ? 1 : 0;
 }
 
@@ -1393,6 +1453,26 @@ int main(int argc, char *argv[]) {
     hlog("oui override: loaded %d entries from %s",
          override_loaded, OUI_OVERRIDE_JSON);
 
+    /* v3.8.4: 启动异步 mDNS worker
+     *
+     * Worker 只处理 re-resolve 路径(scan_arp 里 hnc_should_re_resolve 触发
+     * 的 mdns 查询),这些以前会同步阻塞主循环最多 800ms。pending 路径
+     * 用的是 resolve_hostname_dhcp_only,不查 mdns,不走 worker。
+     *
+     * Worker 通过函数指针注入 try_mdns_resolve,这样 mdns_worker.c
+     * 不依赖 hotspotd.c 的 static 函数,单元测试可以注入 mock。
+     *
+     * 如果 worker 启动失败,hlog 警告但不 abort — 主循环可以继续跑,
+     * re-resolve 路径会在 enqueue 失败后降级为 mac 兜底。*/
+    hnc_mdns_worker_set_resolve_fn(try_mdns_resolve);
+    int worker_rc = hnc_mdns_worker_start();
+    if (worker_rc != 0) {
+        hlog("WARN: mdns worker start failed (rc=%d), re-resolve will fall back to mac",
+             worker_rc);
+    } else {
+        hlog("mdns worker: started (queue size %d)", HNC_MDNS_QUEUE_SIZE);
+    }
+
     /* 初始扫描 */
     scan_arp();
 
@@ -1430,6 +1510,46 @@ int main(int argc, char *argv[]) {
          * 同时上线时,主线程会被 N × 800ms 的同步 popen 阻塞。
          * 现在新设备只做快速解析,pending 设备由这里每秒处理一个,主线程永不阻塞超过 ~800ms。 */
         process_pending_mdns();
+
+        /* v3.8.4: drain 异步 mDNS worker 的结果
+         *
+         * Worker 在独立线程完成 mDNS 查询(re-resolve 路径的 800ms 阻塞),
+         * 把结果放到结果队列。主循环每 tick 来取一次,把 hostname 写回
+         * 对应的 g_devs 条目。g_devs 依然是主线程独占,零锁。
+         *
+         * 如果某个 MAC 在查询期间已经下线或被别的路径更新,find_device
+         * 会返回 NULL 或者已经被写成别的值,此时丢弃结果是安全的。
+         *
+         * 失败的查询(success=0)会把 hostname_src 从 "pending" 降级到
+         * "mac",避免用户在 WebUI 看到永远的 "pending" 标签。*/
+        {
+            hnc_mdns_result_t mdns_results[HNC_MDNS_QUEUE_SIZE];
+            int got = hnc_mdns_worker_drain_results(mdns_results, HNC_MDNS_QUEUE_SIZE);
+            for (int i = 0; i < got; i++) {
+                Device *d = find_device(mdns_results[i].mac);
+                if (!d) continue;  /* 设备已下线或被清理,丢弃结果 */
+                /* 只处理当前是 pending 状态的设备,避免覆盖 manual/dhcp
+                 * 等更高优先级的结果(如果在查询期间被别的路径改过) */
+                if (strcmp(d->hostname_src, "pending") != 0) continue;
+
+                if (mdns_results[i].success) {
+                    strncpy(d->hostname, mdns_results[i].hostname, sizeof(d->hostname)-1);
+                    d->hostname[sizeof(d->hostname)-1] = '\0';
+                    strncpy(d->hostname_src, "mdns", sizeof(d->hostname_src)-1);
+                    d->hostname_src[sizeof(d->hostname_src)-1] = '\0';
+                    /* v3.8.1: 命中 mdns 也更新持久化 cache */
+                    hnc_cache_update(d->mac, d->hostname, "mdns");
+                    hlog("async mdns: %s → %s", d->mac, d->hostname);
+                } else {
+                    /* 查询失败,从 pending 降级到 mac 兜底 */
+                    hnc_mac_fallback(d->mac, d->hostname, sizeof(d->hostname));
+                    strncpy(d->hostname_src, "mac", sizeof(d->hostname_src)-1);
+                    d->hostname_src[sizeof(d->hostname_src)-1] = '\0';
+                }
+                g_dirty = 1;
+                g_last_event = time(NULL);
+            }
+        }
 
         time_t now = time(NULL);
 
@@ -1523,6 +1643,12 @@ cleanup:
         hnc_cache_save();
         hlog("hostname cache: final save on shutdown");
     }
+
+    /* v3.8.4: 停止异步 mDNS worker
+     * 幂等,即使 worker 没启动也安全。最多等最后一个任务完成(~800ms)。
+     * 必须在关 socket/unlink PID 之前,保证 worker 干净退出后再释放资源。*/
+    hnc_mdns_worker_stop();
+
     if (g_nl_fd  >= 0) close(g_nl_fd);
     if (g_srv_fd >= 0) { close(g_srv_fd); unlink(SOCK_PATH); }
     /* v3.5.2 P1-D: 验证 PID 文件是自己的才 unlink */
